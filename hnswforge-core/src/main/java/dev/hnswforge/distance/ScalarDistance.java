@@ -10,7 +10,7 @@ import java.util.Objects;
  *
  * <p>Each metric is computed as a smaller-is-closer distance. Cosine distance
  * normalizes both operands, so it is invariant to scaling and rejects zero vectors.
- * This class is the correctness oracle for the optimized SIMD kernels added later.
+ * This class is the correctness oracle for the optimized SIMD kernels.
  *
  * <p>Thread-safety: stateless and immutable; safe for concurrent use.
  */
@@ -52,7 +52,24 @@ public final class ScalarDistance implements DistanceFunction {
             throw new IllegalArgumentException(
                     "dimension mismatch: " + a.length + " vs " + b.length);
         }
-        return compute(a, b, a.length);
+        return distance(a, 0, b, 0, a.length);
+    }
+
+    @Override
+    public float distance(float[] a, int aOffset, float[] b, int bOffset, int dim) {
+        Objects.requireNonNull(a, "a must not be null");
+        Objects.requireNonNull(b, "b must not be null");
+        if (dim <= 0) {
+            throw new IllegalArgumentException("dim must be > 0, got " + dim);
+        }
+        if (aOffset < 0 || bOffset < 0 || aOffset + dim > a.length || bOffset + dim > b.length) {
+            throw new IllegalArgumentException("offset/dim outside array bounds");
+        }
+        return switch (metric) {
+            case L2 -> (float) squaredL2(a, aOffset, b, bOffset, dim);
+            case INNER_PRODUCT -> 1.0f - (float) dot(a, aOffset, b, bOffset, dim);
+            case COSINE -> cosine(a, aOffset, b, bOffset, dim);
+        };
     }
 
     @Override
@@ -63,13 +80,12 @@ public final class ScalarDistance implements DistanceFunction {
             throw new IllegalArgumentException("dim must be > 0, got " + dim);
         }
         if (a.length != dim) {
-            throw new IllegalArgumentException(
-                    "dimension mismatch: " + a.length + " vs " + dim);
+            throw new IllegalArgumentException("dimension mismatch: " + a.length + " vs " + dim);
         }
         if (byteOffset < 0 || byteOffset + (long) dim * Float.BYTES > segment.byteSize()) {
             throw new IllegalArgumentException(
-                    "byte offset " + byteOffset + " with " + dim + " floats is outside a segment of "
-                            + segment.byteSize() + " bytes");
+                    "byte offset " + byteOffset + " with " + dim
+                            + " floats is outside a segment of " + segment.byteSize() + " bytes");
         }
         return switch (metric) {
             case L2 -> (float) squaredL2(segment, a, byteOffset, dim);
@@ -78,25 +94,17 @@ public final class ScalarDistance implements DistanceFunction {
         };
     }
 
-    private float compute(float[] a, float[] b, int dim) {
-        return switch (metric) {
-            case L2 -> (float) squaredL2(a, b, dim);
-            case INNER_PRODUCT -> 1.0f - (float) dot(a, b, dim);
-            case COSINE -> cosine(a, b, dim);
-        };
-    }
-
-    private float cosine(float[] a, float[] b, int dim) {
-        double normA = norm(a, dim);
-        double normB = norm(b, dim);
+    private float cosine(float[] a, int aOffset, float[] b, int bOffset, int dim) {
+        double normA = norm(a, aOffset, dim);
+        double normB = norm(b, bOffset, dim);
         if (normA == 0.0 || normB == 0.0) {
             throw new IllegalArgumentException("cosine distance is undefined for a zero vector");
         }
-        return (float) (1.0 - dot(a, b, dim) / (normA * normB));
+        return (float) (1.0 - dot(a, aOffset, b, bOffset, dim) / (normA * normB));
     }
 
     private float cosine(MemorySegment segment, float[] a, long byteOffset, int dim) {
-        double normA = norm(a, dim);
+        double normA = norm(a, 0, dim);
         double normB = norm(segment, byteOffset, dim);
         if (normA == 0.0 || normB == 0.0) {
             throw new IllegalArgumentException("cosine distance is undefined for a zero vector");
@@ -104,10 +112,10 @@ public final class ScalarDistance implements DistanceFunction {
         return (float) (1.0 - dot(segment, a, byteOffset, dim) / (normA * normB));
     }
 
-    private static double norm(float[] a, int dim) {
+    private static double norm(float[] a, int offset, int dim) {
         double sum = 0.0;
         for (int i = 0; i < dim; i++) {
-            float value = requireFinite(a[i]);
+            float value = requireFinite(a[offset + i]);
             sum += (double) value * value;
         }
         return Math.sqrt(sum);
@@ -122,10 +130,10 @@ public final class ScalarDistance implements DistanceFunction {
         return Math.sqrt(sum);
     }
 
-    private static double dot(float[] a, float[] b, int dim) {
+    private static double dot(float[] a, int aOffset, float[] b, int bOffset, int dim) {
         double sum = 0.0;
         for (int i = 0; i < dim; i++) {
-            sum += (double) requireFinite(a[i]) * requireFinite(b[i]);
+            sum += (double) requireFinite(a[aOffset + i]) * requireFinite(b[bOffset + i]);
         }
         return sum;
     }
@@ -138,10 +146,11 @@ public final class ScalarDistance implements DistanceFunction {
         return sum;
     }
 
-    private static double squaredL2(float[] a, float[] b, int dim) {
+    private static double squaredL2(float[] a, int aOffset, float[] b, int bOffset, int dim) {
         double sum = 0.0;
         for (int i = 0; i < dim; i++) {
-            double difference = (double) requireFinite(a[i]) - requireFinite(b[i]);
+            double difference = (double) requireFinite(a[aOffset + i])
+                    - requireFinite(b[bOffset + i]);
             sum += difference * difference;
         }
         return sum;

@@ -1,83 +1,125 @@
 package dev.hnswforge.index;
 
 import dev.hnswforge.distance.DistanceFunction;
-import dev.hnswforge.distance.ScalarDistance;
-import dev.hnswforge.util.BoundedMaxHeap;
-import dev.hnswforge.util.MinHeap;
+import dev.hnswforge.distance.DistanceFunctions;
+import dev.hnswforge.storage.HeapVectorStore;
+import dev.hnswforge.storage.OffHeapVectorStore;
+import dev.hnswforge.storage.StorageMode;
+import dev.hnswforge.storage.VectorStore;
+import dev.hnswforge.util.SearchScratch;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Comparator;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.SplittableRandom;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
- * Naive but correct HNSW index using object-based storage and a coarse read-write lock.
+ * HNSW index with flat vector and adjacency storage, epoch-stamped visited sets
+ * and reusable per-thread search buffers.
  *
- * <p>Insertion follows the paper: a random level is drawn, the graph is descended
- * greedily through upper layers, and each visited layer gets a best-first search
- * whose results are used to connect the new node bidirectionally. Searches use the
- * same best-first procedure at layer 0 after a greedy descent from the top layer.
- * All randomness comes from the seed in {@link HnswParams}, so a given seed and
- * insertion order produce an identical graph. Deletes are tombstones: deleted nodes
- * remain in the graph and are traversed but never returned; {@link #liveCount()}
- * excludes them while {@link #size()} counts every inserted vector.
+ * <p>Vectors live in a contiguous {@link VectorStore} (heap or off-heap); layer 0
+ * adjacency lives in one flat {@code int[]} with a degree word followed by neighbor
+ * ids per node, and upper layers are allocated lazily. Searches take a read lock
+ * and allocate only the returned result list; inserts take a write lock. Random
+ * levels derive entirely from the seed in {@link HnswParams}.
  *
- * <p>Thread-safety: thread-safe. Inserts take the write lock and searches take the
- * read lock; reads therefore never observe a partially inserted node.
+ * <p>Deletes are tombstones: deleted nodes remain in the graph and are traversed
+ * but never returned. {@link #size()} counts all inserts, {@link #liveCount()}
+ * excludes tombstones.
+ *
+ * <p>Thread-safety: thread-safe for concurrent inserts and searches.
  */
 public final class HnswIndex implements VectorIndex {
     private static final int MAX_LEVEL_CAP = 32;
 
     private final HnswParams params;
-    private final DistanceFunction distance;
+    private final VectorStore store;
+    private final StorageMode storageMode;
+    private final boolean prefetch;
     private final SplittableRandom random;
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+    private final ThreadLocal<SearchScratch> scratch;
 
-    private final float[][] vectors;
     private final int[] levels;
-    private final int[][][] neighbors;
-    private final int[][] neighborCounts;
+    private final int[] layer0;
+    private final int[][] upper;
+    private final int layer0Stride;
+    private final int upperStride;
     private final boolean[] deleted;
     private int entryPoint = -1;
     private int maxLevel = -1;
     private int size;
     private int liveCount;
 
-    /** Creates an empty index with the capacity declared in {@code params}. */
+    /** Creates an index with SIMD kernels, on-heap storage and prefetch batching. */
     public HnswIndex(HnswParams params) {
+        this(params, true, StorageMode.HEAP, true);
+    }
+
+    /**
+     * Creates an index with explicit kernel and storage choices and prefetch batching.
+     *
+     * @param params       construction parameters
+     * @param preferSimd   whether to use the Vector API when available
+     * @param storageMode  heap or off-heap vector storage
+     */
+    public HnswIndex(HnswParams params, boolean preferSimd, StorageMode storageMode) {
+        this(params, preferSimd, storageMode, true);
+    }
+
+    /**
+     * Creates an index with explicit kernel, storage and traversal choices.
+     *
+     * @param params       construction parameters
+     * @param preferSimd   whether to use the Vector API when available
+     * @param storageMode  heap or off-heap vector storage
+     * @param prefetch     whether to batch neighbor discovery before computing distances
+     */
+    public HnswIndex(HnswParams params, boolean preferSimd, StorageMode storageMode,
+                     boolean prefetch) {
         this.params = Objects.requireNonNull(params, "params must not be null");
-        this.distance = ScalarDistance.forMetric(params.metric());
+        this.storageMode = Objects.requireNonNull(storageMode, "storageMode must not be null");
+        this.prefetch = prefetch;
+        DistanceFunction kernel = DistanceFunctions.forMetric(params.metric(), preferSimd);
+        this.store = switch (storageMode) {
+            case HEAP -> new HeapVectorStore(params.dimension(), params.maxElements(), kernel);
+            case OFF_HEAP -> new OffHeapVectorStore(params.dimension(), params.maxElements(), kernel);
+        };
         this.random = new SplittableRandom(params.seed());
         int capacity = params.maxElements();
-        this.vectors = new float[capacity][];
         this.levels = new int[capacity];
-        this.neighbors = new int[capacity][][];
-        this.neighborCounts = new int[capacity][];
+        this.layer0Stride = 1 + params.maxM0();
+        this.upperStride = 1 + params.m();
+        this.layer0 = new int[Math.multiplyExact(capacity, layer0Stride)];
+        this.upper = new int[capacity][];
         this.deleted = new boolean[capacity];
+        this.scratch = ThreadLocal.withInitial(() -> new SearchScratch(
+                params.dimension(), capacity,
+                Math.max(params.efConstruction(), params.efSearch()), params.maxM0()));
     }
 
     @Override
     public int add(float[] vector) {
-        float[] stored = prepare(vector);
+        float[] prepared = prepare(vector, scratch.get().query);
+        SearchScratch local = scratch.get();
         lock.writeLock().lock();
         try {
-            if (size >= vectors.length) {
+            if (size >= params.maxElements()) {
                 throw new IllegalStateException(
-                        "index capacity exceeded: " + vectors.length + " elements");
+                        "index capacity exceeded: " + params.maxElements() + " elements");
             }
             int id = size++;
             liveCount++;
-            vectors[id] = stored;
+            store.set(id, prepared);
             int level = randomLevel();
             levels[id] = level;
-            neighbors[id] = new int[level + 1][];
-            neighborCounts[id] = new int[level + 1];
-            for (int layer = 0; layer <= level; layer++) {
-                neighbors[id][layer] = new int[layer == 0 ? params.maxM0() : params.m()];
+            if (level > 0) {
+                upper[id] = new int[level * upperStride];
             }
+
             if (id == 0) {
                 entryPoint = 0;
                 maxLevel = level;
@@ -86,27 +128,33 @@ public final class HnswIndex implements VectorIndex {
 
             int[] entryPoints = {entryPoint};
             for (int layer = maxLevel; layer > level; layer--) {
-                entryPoints = new int[] {greedyDescend(stored, entryPoints[0], layer, layer - 1)};
+                entryPoints = new int[] {greedyDescend(prepared, entryPoints[0], layer, layer - 1)};
             }
 
             for (int layer = Math.min(level, maxLevel); layer >= 0; layer--) {
-                List<Candidate> found = searchLayer(stored, entryPoints, params.efConstruction(), layer);
-                int[] chosen = selectNeighbors(id, found, params.m());
+                int found = searchLayer(prepared, entryPoints, entryPoints.length,
+                        params.efConstruction(), layer, local);
+                int[] foundIds = Arrays.copyOf(local.foundIds, found);
+                float[] foundDistances = Arrays.copyOf(local.foundDistances, found);
+                int chosenCount = selectByStrategy(id, foundIds, foundDistances, found,
+                        params.m(), local.chosen);
+                int[] chosen = Arrays.copyOf(local.chosen, chosenCount);
                 int bound = layer == 0 ? params.maxM0() : params.m();
-                connect(id, layer, chosen, bound);
+                setNeighbors(id, layer, chosen, chosenCount);
                 for (int neighbor : chosen) {
-                    int count = neighborCounts[neighbor][layer];
+                    int count = neighborCount(neighbor, layer);
                     if (count < bound) {
-                        neighbors[neighbor][layer][count] = id;
-                        neighborCounts[neighbor][layer] = count + 1;
+                        setNeighborAt(neighbor, layer, count, id);
+                        setNeighborCount(neighbor, layer, count + 1);
                     } else {
-                        List<Candidate> combined = candidatesFor(neighbor, layer, count, id);
-                        int[] pruned = selectNeighbors(neighbor, combined, bound);
-                        System.arraycopy(pruned, 0, neighbors[neighbor][layer], 0, pruned.length);
-                        neighborCounts[neighbor][layer] = pruned.length;
+                        int combinedCount = gatherWithExtra(neighbor, layer, id, local);
+                        sortCandidates(local.combinedIds, local.combinedDistances, combinedCount);
+                        int prunedCount = selectByStrategy(neighbor, local.combinedIds,
+                                local.combinedDistances, combinedCount, bound, local.chosen);
+                        setNeighbors(neighbor, layer, local.chosen, prunedCount);
                     }
                 }
-                entryPoints = found.stream().mapToInt(Candidate::id).toArray();
+                entryPoints = foundIds;
             }
 
             if (level > maxLevel) {
@@ -132,25 +180,25 @@ public final class HnswIndex implements VectorIndex {
         if (efSearch < 1) {
             throw new IllegalArgumentException("efSearch must be >= 1, got " + efSearch);
         }
-        float[] prepared = prepare(query);
+        SearchScratch local = scratch.get();
+        float[] prepared = prepare(query, local.query);
         lock.readLock().lock();
         try {
             if (size == 0) {
                 return List.of();
             }
             int entry = greedyDescend(prepared, entryPoint, maxLevel, 1);
-            List<Candidate> found = searchLayer(prepared, new int[] {entry},
-                    Math.max(efSearch, k), 0);
-            List<SearchResult> results = new ArrayList<>(Math.min(k, found.size()));
-            for (Candidate candidate : found) {
-                if (results.size() == k) {
-                    break;
-                }
-                if (!deleted[candidate.id()]) {
-                    results.add(new SearchResult(candidate.id(), candidate.distance()));
+            local.entryBuffer[0] = entry;
+            int found = searchLayer(prepared, local.entryBuffer, 1, Math.max(efSearch, k),
+                    0, local);
+            List<SearchResult> results = new ArrayList<>(Math.min(k, found));
+            for (int i = 0; i < found && results.size() < k; i++) {
+                int id = local.foundIds[i];
+                if (!deleted[id]) {
+                    results.add(new SearchResult(id, local.foundDistances[i]));
                 }
             }
-            return List.copyOf(results);
+            return results;
         } finally {
             lock.readLock().unlock();
         }
@@ -220,6 +268,11 @@ public final class HnswIndex implements VectorIndex {
         return params;
     }
 
+    /** @return the storage mode used for vectors */
+    public StorageMode storageMode() {
+        return storageMode;
+    }
+
     @Override
     public void save(Path path) throws IOException {
         throw new UnsupportedOperationException("Persistence is implemented in Phase 5");
@@ -227,6 +280,7 @@ public final class HnswIndex implements VectorIndex {
 
     @Override
     public void close() {
+        store.close();
     }
 
     int level(int id) {
@@ -234,7 +288,7 @@ public final class HnswIndex implements VectorIndex {
     }
 
     float[] vector(int id) {
-        return vectors[id];
+        return store.copyOf(id);
     }
 
     int entryPoint() {
@@ -246,82 +300,125 @@ public final class HnswIndex implements VectorIndex {
     }
 
     int neighborCount(int id, int layer) {
-        return neighborCounts[id][layer];
+        if (layer == 0) {
+            return layer0[id * layer0Stride];
+        }
+        int[] slice = upper[id];
+        return slice == null ? 0 : slice[(layer - 1) * upperStride];
     }
 
     int neighborAt(int id, int layer, int index) {
-        return neighbors[id][layer][index];
+        if (layer == 0) {
+            return layer0[id * layer0Stride + 1 + index];
+        }
+        return upper[id][(layer - 1) * upperStride + 1 + index];
     }
 
     int[] selectHeuristic(int baseId, List<Candidate> sorted, int limit, boolean keepPruned) {
-        List<Candidate> selected = new ArrayList<>();
-        List<Candidate> pruned = new ArrayList<>();
-        for (Candidate candidate : sorted) {
-            if (selected.size() == limit) {
-                break;
+        int count = sorted.size();
+        int[] ids = new int[count];
+        float[] distances = new float[count];
+        for (int i = 0; i < count; i++) {
+            ids[i] = sorted.get(i).id();
+            distances[i] = sorted.get(i).distance();
+        }
+        int[] out = new int[limit];
+        int selected = selectNeighbors(baseId, ids, distances, count, limit, out, keepPruned);
+        return Arrays.copyOf(out, selected);
+    }
+
+    private void setNeighbors(int id, int layer, int[] ids, int count) {
+        if (layer == 0) {
+            int offset = id * layer0Stride;
+            layer0[offset] = count;
+            System.arraycopy(ids, 0, layer0, offset + 1, count);
+        } else {
+            int[] slice = upper[id];
+            int offset = (layer - 1) * upperStride;
+            slice[offset] = count;
+            System.arraycopy(ids, 0, slice, offset + 1, count);
+        }
+    }
+
+    private void setNeighborCount(int id, int layer, int count) {
+        if (layer == 0) {
+            layer0[id * layer0Stride] = count;
+        } else {
+            upper[id][(layer - 1) * upperStride] = count;
+        }
+    }
+
+    private void setNeighborAt(int id, int layer, int index, int neighbor) {
+        if (layer == 0) {
+            layer0[id * layer0Stride + 1 + index] = neighbor;
+        } else {
+            upper[id][(layer - 1) * upperStride + 1 + index] = neighbor;
+        }
+    }
+
+    private int gatherWithExtra(int baseId, int layer, int extraId, SearchScratch local) {
+        int count = neighborCount(baseId, layer);
+        for (int i = 0; i < count; i++) {
+            int id = neighborAt(baseId, layer, i);
+            local.combinedIds[i] = id;
+            local.combinedDistances[i] = store.dist(baseId, id);
+        }
+        local.combinedIds[count] = extraId;
+        local.combinedDistances[count] = store.dist(baseId, extraId);
+        return count + 1;
+    }
+
+    private static void sortCandidates(int[] ids, float[] distances, int count) {
+        for (int i = 1; i < count; i++) {
+            int id = ids[i];
+            float distance = distances[i];
+            int j = i - 1;
+            while (j >= 0 && (distances[j] > distance
+                    || (distances[j] == distance && ids[j] > id))) {
+                ids[j + 1] = ids[j];
+                distances[j + 1] = distances[j];
+                j--;
             }
+            ids[j + 1] = id;
+            distances[j + 1] = distance;
+        }
+    }
+
+    private int selectNeighbors(int baseId, int[] ids, float[] distances, int count,
+                                int limit, int[] out, boolean keepPruned) {
+        int selected = 0;
+        boolean[] used = new boolean[count];
+        for (int i = 0; i < count && selected < limit; i++) {
             boolean diverse = true;
-            for (Candidate chosen : selected) {
-                if (distance.distance(vectors[baseId], vectors[candidate.id()])
-                        < candidate.distance()) {
+            for (int j = 0; j < selected; j++) {
+                if (store.dist(ids[i], out[j]) < distances[i]) {
                     diverse = false;
                     break;
                 }
             }
             if (diverse) {
-                selected.add(candidate);
-            } else {
-                pruned.add(candidate);
+                out[selected++] = ids[i];
+                used[i] = true;
             }
         }
         if (keepPruned) {
-            for (Candidate candidate : pruned) {
-                if (selected.size() == limit) {
-                    break;
+            for (int i = 0; i < count && selected < limit; i++) {
+                if (!used[i]) {
+                    out[selected++] = ids[i];
                 }
-                selected.add(candidate);
             }
         }
-        return idsOf(selected, limit);
+        return selected;
     }
 
-    private void connect(int id, int layer, int[] chosen, int bound) {
-        if (chosen.length > bound) {
-            throw new IllegalStateException("neighbor selection exceeded the degree bound");
-        }
-        System.arraycopy(chosen, 0, neighbors[id][layer], 0, chosen.length);
-        neighborCounts[id][layer] = chosen.length;
-    }
-
-    private List<Candidate> candidatesFor(int baseId, int layer, int count, int extraId) {
-        List<Candidate> candidates = new ArrayList<>(count + 1);
-        for (int i = 0; i < count; i++) {
-            int id = neighbors[baseId][layer][i];
-            candidates.add(new Candidate(id, distance.distance(vectors[baseId], vectors[id])));
-        }
-        if (extraId >= 0) {
-            candidates.add(new Candidate(extraId,
-                    distance.distance(vectors[baseId], vectors[extraId])));
-        }
-        candidates.sort(Comparator.comparingDouble(Candidate::distance)
-                .thenComparingInt(Candidate::id));
-        return candidates;
-    }
-
-    private int[] selectNeighbors(int baseId, List<Candidate> sorted, int limit) {
+    private int selectByStrategy(int baseId, int[] ids, float[] distances, int count,
+                                 int limit, int[] out) {
         if (params.neighborSelection() == NeighborSelection.SIMPLE) {
-            return idsOf(sorted, limit);
+            int result = Math.min(limit, count);
+            System.arraycopy(ids, 0, out, 0, result);
+            return result;
         }
-        return selectHeuristic(baseId, sorted, limit, false);
-    }
-
-    private static int[] idsOf(List<Candidate> candidates, int limit) {
-        int count = Math.min(limit, candidates.size());
-        int[] ids = new int[count];
-        for (int i = 0; i < count; i++) {
-            ids[i] = candidates.get(i).id();
-        }
-        return ids;
+        return selectNeighbors(baseId, ids, distances, count, limit, out, false);
     }
 
     private int randomLevel() {
@@ -330,58 +427,74 @@ public final class HnswIndex implements VectorIndex {
         return Math.min(level, MAX_LEVEL_CAP);
     }
 
-    private List<Candidate> searchLayer(float[] query, int[] entryPoints, int ef, int layer) {
-        boolean[] visited = new boolean[size];
-        MinHeap candidates = new MinHeap();
-        BoundedMaxHeap results = new BoundedMaxHeap(ef);
-        for (int entry : entryPoints) {
-            if (entry < 0 || entry >= size || visited[entry]) {
+    private int searchLayer(float[] query, int[] entryPoints, int entryCount, int ef,
+                            int layer, SearchScratch local) {
+        local.visited.begin();
+        local.candidates.clear();
+        local.results.reset(ef);
+        local.ensureFound(ef);
+        for (int i = 0; i < entryCount; i++) {
+            int entry = entryPoints[i];
+            if (entry < 0 || entry >= size || !local.visited.mark(entry)) {
                 continue;
             }
-            visited[entry] = true;
-            float distanceToEntry = distance.distance(query, vectors[entry]);
-            candidates.push(entry, distanceToEntry);
-            results.push(entry, distanceToEntry);
+            float distanceToEntry = store.dist(query, entry);
+            local.candidates.push(entry, distanceToEntry);
+            local.results.push(entry, distanceToEntry);
         }
-        while (candidates.size() > 0) {
-            int current = candidates.pop();
-            float currentDistance = candidates.popDistance();
-            if (results.size() == ef && currentDistance > results.peekDistance()) {
+        while (local.candidates.size() > 0) {
+            int current = local.candidates.pop();
+            float currentDistance = local.candidates.popDistance();
+            if (local.results.size() == ef && currentDistance > local.results.peekDistance()) {
                 break;
             }
             if (layer > levels[current]) {
                 continue;
             }
-            int[] adjacent = neighbors[current][layer];
-            int count = neighborCounts[current][layer];
-            for (int i = 0; i < count; i++) {
-                int neighbor = adjacent[i];
-                if (neighbor < 0 || neighbor >= size || visited[neighbor]) {
-                    continue;
+            int count = neighborCount(current, layer);
+            if (prefetch) {
+                int batch = 0;
+                for (int i = 0; i < count; i++) {
+                    int neighbor = neighborAt(current, layer, i);
+                    if (neighbor >= 0 && neighbor < size && local.visited.mark(neighbor)) {
+                        local.neighborBatch[batch++] = neighbor;
+                    }
                 }
-                visited[neighbor] = true;
-                float distanceToNeighbor = distance.distance(query, vectors[neighbor]);
-                if (results.size() < ef || distanceToNeighbor < results.peekDistance()) {
-                    candidates.push(neighbor, distanceToNeighbor);
-                    results.push(neighbor, distanceToNeighbor);
+                for (int i = 0; i < batch; i++) {
+                    int neighbor = local.neighborBatch[i];
+                    float distanceToNeighbor = store.dist(query, neighbor);
+                    if (local.results.size() < ef
+                            || distanceToNeighbor < local.results.peekDistance()) {
+                        local.candidates.push(neighbor, distanceToNeighbor);
+                        local.results.push(neighbor, distanceToNeighbor);
+                    }
+                }
+            } else {
+                for (int i = 0; i < count; i++) {
+                    int neighbor = neighborAt(current, layer, i);
+                    if (neighbor < 0 || neighbor >= size || !local.visited.mark(neighbor)) {
+                        continue;
+                    }
+                    float distanceToNeighbor = store.dist(query, neighbor);
+                    if (local.results.size() < ef
+                            || distanceToNeighbor < local.results.peekDistance()) {
+                        local.candidates.push(neighbor, distanceToNeighbor);
+                        local.results.push(neighbor, distanceToNeighbor);
+                    }
                 }
             }
         }
-        return sortedCandidates(results);
-    }
-
-    private static List<Candidate> sortedCandidates(BoundedMaxHeap heap) {
-        int count = heap.size();
-        Candidate[] sorted = new Candidate[count];
-        for (int index = count - 1; index >= 0; index--) {
-            sorted[index] = new Candidate(heap.pop(), heap.popDistance());
+        int found = local.results.size();
+        for (int index = found - 1; index >= 0; index--) {
+            local.foundIds[index] = local.results.pop();
+            local.foundDistances[index] = local.results.popDistance();
         }
-        return List.of(sorted);
+        return found;
     }
 
     private int greedyDescend(float[] query, int entry, int fromLayer, int toLayer) {
         int current = entry;
-        float currentDistance = distance.distance(query, vectors[current]);
+        float currentDistance = store.dist(query, current);
         for (int layer = fromLayer; layer > toLayer; layer--) {
             if (layer > levels[current]) {
                 continue;
@@ -389,14 +502,14 @@ public final class HnswIndex implements VectorIndex {
             boolean improved;
             do {
                 improved = false;
-                int[] adjacent = neighbors[current][layer];
-                int count = neighborCounts[current][layer];
+                int node = current;
+                int count = neighborCount(node, layer);
                 for (int i = 0; i < count; i++) {
-                    int neighbor = adjacent[i];
+                    int neighbor = neighborAt(node, layer, i);
                     if (neighbor < 0 || neighbor >= size) {
                         continue;
                     }
-                    float distanceToNeighbor = distance.distance(query, vectors[neighbor]);
+                    float distanceToNeighbor = store.dist(query, neighbor);
                     if (distanceToNeighbor < currentDistance) {
                         current = neighbor;
                         currentDistance = distanceToNeighbor;
@@ -408,25 +521,25 @@ public final class HnswIndex implements VectorIndex {
         return current;
     }
 
-    private float[] prepare(float[] vector) {
+    private float[] prepare(float[] vector, float[] target) {
         Objects.requireNonNull(vector, "vector must not be null");
         if (vector.length != params.dimension()) {
             throw new IllegalArgumentException("dimension mismatch: expected "
                     + params.dimension() + ", got " + vector.length);
         }
-        float[] copy = vector.clone();
-        for (float value : copy) {
+        for (float value : vector) {
             if (Float.isNaN(value)) {
                 throw new IllegalArgumentException("vector values must not be NaN");
             }
         }
+        System.arraycopy(vector, 0, target, 0, params.dimension());
         if (params.metric() == Metric.COSINE) {
-            copy = normalize(copy);
+            normalize(target);
         }
-        return copy;
+        return target;
     }
 
-    private static float[] normalize(float[] vector) {
+    private static void normalize(float[] vector) {
         double sum = 0.0;
         for (float value : vector) {
             sum += (double) value * value;
@@ -438,9 +551,8 @@ public final class HnswIndex implements VectorIndex {
         for (int i = 0; i < vector.length; i++) {
             vector[i] = (float) (vector[i] / norm);
         }
-        return vector;
     }
 
-    /** A candidate id paired with its distance from the query or base vector. */
+    /** A candidate id paired with its distance, used by the heuristic test hook. */
     record Candidate(int id, float distance) {}
 }

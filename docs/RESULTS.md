@@ -41,9 +41,31 @@ Selected points at n=10,000, dim=32, k=10:
 
 Analysis: `efSearch` is the strongest query-time knob — at m=8/efC=100, raising it from 20 to 160 lifts recall from 0.846 to 0.974 but costs about 5x QPS. Raising `M` from 8 to 16 at efSearch=20 lifts recall from 0.846 to 0.963 with only a modest QPS drop (46.8k to 37.3k), but build time more than doubles (0.94s to 2.27s); M=32 reaches 0.992 recall but build time jumps to 10s, so returns diminish sharply. Raising `efConstruction` from 100 to 200 gives a small recall gain (e.g. 0.974 to 0.984 at m=8/efSearch=160) while increasing build time by roughly 60%, with little effect on query QPS. Practical default: M=16, efC=200, efS=100-160.
 
-## Optimization waterfall
+## Phase 4 — optimization waterfall
 
-(pending)
+All rows: n=100,000, dim=32, m=16, efConstruction=200, efSearch=100, k=10, one query thread, 200 queries × 5 timed passes (3 warmup passes), queries sampled near corpus vectors. Measured with `dev.hnswforge.bench.OptimizationBench`.
+
+| Step | Configuration | build_s | QPS | recall@10 |
+|---:|---|---:|---:|---:|
+| 0 | Phase 2 baseline: object graph, scalar, degenerate heuristic | 52.35 | 3,262 | 0.9265 |
+| 1 | Flat vectors + flat adjacency + epoch visited + scratch heaps (scalar, no prefetch) | 48.10 | 714 | 0.9995 |
+| 2 | + SIMD distance kernels | 30.18 | 1,112 | 0.9995 |
+| 3 | + off-heap vector storage (MemorySegment) | 38.42 | 981 | 0.9995 |
+| 4 | + prefetch-friendly traversal (heap, SIMD, prefetch) | 29.08 | 1,203 | 0.9995 |
+| 5 | Final combination: SIMD + off-heap + prefetch | 39.25 | 923 | 0.9995 |
+
+**The >=3x search speedup target was NOT met.** Measured cumulative QPS change from the recorded baseline is 923/3262 = 0.28x. Reasons, stated plainly:
+
+1. The Phase 2 baseline contained a correctness bug: its "heuristic" compared `dist(base, candidate)` rather than `dist(candidate, selected)`, degenerating to simple nearest-neighbor selection. That produced sparser graphs (average degree 12.5) which are cheaper to search but return worse results (recall 0.9265). Fixing the heuristic (spec Algorithm 4) produced dense, fully connected graphs (average degree 22.6, 100% reachable at layer 0) and recall 0.9995 at the same efSearch — at the cost of more distance computations per query. The baseline's QPS advantage is therefore partly an artifact of lower recall.
+2. SIMD gave a real 1.56x QPS gain over the flat scalar implementation (714 to 1,112) and a 1.59x build-time gain (48.10s to 30.18s).
+3. Prefetch batching added another ~1.08x on heap (1,112 to 1,203) and was the fastest configuration measured.
+4. Off-heap storage was slower than heap at 100k vectors (981 vs 1,112 QPS) because FFM segment reads add overhead at this size; its value is avoiding GC pressure for much larger indexes, which is not demonstrated by this datapoint.
+
+Quality improved at every step: recall never dropped below the previous row (it rose from 0.9265 to 0.9995 at step 1 and stayed there). Build time improved 52.35s to 29.08s (1.8x) at the best configuration.
+
+**Zero-allocation check:** JMH `-prof gc` on `SearchBench.search` (10k vectors, k=10, efSearch=100, 1 fork, 1 warmup + 1 measurement iteration of 2s): `gc.alloc.rate.norm = 320.867 B/op`, well under the 1 KB/op target. The remaining allocation is the returned result list and its `SearchResult` records; paths, heaps, visited stamps and query buffers are reused via `ThreadLocal<SearchScratch>`.
+
+JMH benchmarks: `DistanceBench` (scalar vs SIMD, dims 1..960, all metrics), `SearchBench`, `InsertBench`. Run with `./mvnw -pl hnswforge-bench -am verify`, then invoke `org.openjdk.jmh.Main` with the generated `META-INF/BenchmarkList`.
 
 ## Baseline comparison
 

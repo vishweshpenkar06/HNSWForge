@@ -1,5 +1,7 @@
 package dev.hnswforge.util;
 
+import java.util.Arrays;
+
 /**
  * A bounded max-heap of {@code (id, distance)} pairs backed by primitive arrays.
  *
@@ -11,8 +13,8 @@ package dev.hnswforge.util;
  * <p>Thread-safety: not thread-safe; callers must serialize access.
  */
 public final class BoundedMaxHeap {
-    private final int[] ids;
-    private final float[] distances;
+    private int[] ids;
+    private float[] distances;
     private int size;
     private float lastPoppedDistance;
 
@@ -97,6 +99,21 @@ public final class BoundedMaxHeap {
     public void clear() {
         size = 0;
         lastPoppedDistance = Float.NaN;
+    }
+
+    /**
+     * Clears the heap and ensures it can hold {@code newCapacity} elements, growing
+     * the backing arrays only when necessary. Used to reuse scratch heaps.
+     */
+    public void reset(int newCapacity) {
+        if (newCapacity <= 0) {
+            throw new IllegalArgumentException("newCapacity must be > 0, got " + newCapacity);
+        }
+        if (newCapacity > ids.length) {
+            ids = Arrays.copyOf(ids, newCapacity);
+            distances = Arrays.copyOf(distances, newCapacity);
+        }
+        clear();
     }
 
     private static boolean isWorse(float distanceA, int idA, float distanceB, int idB) {

@@ -67,6 +67,25 @@ Quality improved at every step: recall never dropped below the previous row (it 
 
 JMH benchmarks: `DistanceBench` (scalar vs SIMD, dims 1..960, all metrics), `SearchBench`, `InsertBench`. Run with `./mvnw -pl hnswforge-bench -am verify`, then invoke `org.openjdk.jmh.Main` with the generated `META-INF/BenchmarkList`.
 
+## Phase 5 — concurrency and persistence
+
+Parallel build of 100,000 vectors (dim=32, m=16, efConstruction=200, synthetic uniform data, `addAll`):
+
+| Threads | build_s | speedup vs 1 thread |
+|---:|---:|---:|
+| 1 | 74.23 | 1.00x |
+| 2 | 44.46 | 1.67x |
+| 4 | 31.94 | 2.32x |
+| 8 | 27.93 | 2.66x |
+
+The scaling is sublinear because insertion contends on striped neighbor-list locks and on the shared entry-point region.
+
+Mapped load of a 1,000,000-vector index file (dim=32, 264,000,128 bytes): `open_s = 0.0776` (full write of the same file took 0.262s). This measures mapping/header validation only; the graph in that synthetic file has no edges, so query results are not comparable to a built index.
+
+Stress tests (all passing): 8 threads insert 50,000 vectors with degree/self-loop/duplicate invariants intact; parallel and sequential builds agree on recall within 0.01; 4 inserting + 4 searching threads run for 10 seconds with no invalid ids or worker failures; a preemptive timeout detects deadlock.
+
+Persistence: v1 round trip preserves results for 1,000 random queries; mapped load returns identical ids with distances matching within 1e-5 (the in-memory index uses SIMD float accumulation, the mapped reader uses the scalar kernel); corrupted magic, wrong version, truncated files and CRC mismatches raise `IndexFormatException`; a committed `v1` fixture loads.
+
 ## Baseline comparison
 
 (pending)

@@ -103,9 +103,22 @@ class HnswIndexTest {
     }
 
     @Test
-    void saveIsUnsupportedUntilPhaseFive() {
-        HnswIndex index = new HnswIndex(HnswParams.builder(1, Metric.L2).build());
-        assertThrows(UnsupportedOperationException.class,
-                () -> index.save(java.nio.file.Path.of("x.bin")));
+    void saveAndLoadRoundTripPreservesSearchResults() throws Exception {
+        float[][] base = SyntheticData.uniform(100, 4, 9L);
+        HnswIndex index = HnswTestUtil.build(base,
+                HnswParams.builder(4, Metric.L2).m(8).efConstruction(100)
+                        .maxElements(100).seed(9L).build());
+        java.nio.file.Path path = java.nio.file.Files.createTempFile("hnsw", ".bin");
+        try {
+            index.save(path);
+            HnswIndex loaded = HnswIndex.load(path);
+            assertEquals(index.size(), loaded.size());
+            assertEquals(index.metric(), loaded.metric());
+            float[] query = base[0];
+            assertEquals(index.search(query, 5), loaded.search(query, 5));
+            loaded.close();
+        } finally {
+            java.nio.file.Files.deleteIfExists(path);
+        }
     }
 }

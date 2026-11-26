@@ -1,58 +1,76 @@
 package dev.hnswforge.index;
 
-import dev.hnswforge.distance.DistanceFunction;
 import dev.hnswforge.distance.DistanceFunctions;
+import dev.hnswforge.persist.HnswSerializer;
+import dev.hnswforge.persist.IndexSnapshot;
+import dev.hnswforge.persist.MappedHnswIndex;
 import dev.hnswforge.storage.HeapVectorStore;
 import dev.hnswforge.storage.OffHeapVectorStore;
 import dev.hnswforge.storage.StorageMode;
 import dev.hnswforge.storage.VectorStore;
 import dev.hnswforge.util.SearchScratch;
 import java.io.IOException;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.SplittableRandom;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicIntegerArray;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * HNSW index with flat vector and adjacency storage, epoch-stamped visited sets
- * and reusable per-thread search buffers.
+ * Concurrent HNSW index with flat storage and disk persistence.
  *
- * <p>Vectors live in a contiguous {@link VectorStore} (heap or off-heap); layer 0
- * adjacency lives in one flat {@code int[]} with a degree word followed by neighbor
- * ids per node, and upper layers are allocated lazily. Searches take a read lock
- * and allocate only the returned result list; inserts take a write lock. Random
- * levels derive entirely from the seed in {@link HnswParams}.
+ * <p>Inserts reserve ids atomically, publish each node with a release store after
+ * its vector and edges are complete, and guard neighbor-list writes with striped
+ * locks. Searches take no locks: they acquire-read degree words, validate neighbor
+ * ids against the current size and skip unpublished nodes. Entry point updates use
+ * a dedicated lock. Lock ordering is trivial because at most one node lock is held
+ * at a time; the entry-point lock is never acquired while holding a node lock.
  *
- * <p>Deletes are tombstones: deleted nodes remain in the graph and are traversed
- * but never returned. {@link #size()} counts all inserts, {@link #liveCount()}
- * excludes tombstones.
+ * <p>Vectors are stored contiguously on heap or off-heap; layer 0 uses one flat
+ * {@code int[]}, upper layers are allocated lazily. All randomness derives from
+ * the seed in {@link HnswParams}. Deletes are tombstones.
  *
- * <p>Thread-safety: thread-safe for concurrent inserts and searches.
+ * <p>Thread-safety: thread-safe for concurrent inserts, deletes and searches.
  */
 public final class HnswIndex implements VectorIndex {
     private static final int MAX_LEVEL_CAP = 32;
+    private static final int LOCK_STRIPES = 4096;
+    private static final int LOCK_MASK = LOCK_STRIPES - 1;
+    private static final VarHandle INT_HANDLE = MethodHandles.arrayElementVarHandle(int[].class);
 
     private final HnswParams params;
     private final VectorStore store;
     private final StorageMode storageMode;
     private final boolean prefetch;
     private final SplittableRandom random;
-    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+    private final Object randomLock = new Object();
     private final ThreadLocal<SearchScratch> scratch;
+    private final ReentrantLock[] nodeLocks = new ReentrantLock[LOCK_STRIPES];
+    private final ReentrantLock entryPointLock = new ReentrantLock();
+    private final AtomicInteger size = new AtomicInteger();
+    private final AtomicInteger liveCount = new AtomicInteger();
+    private final AtomicIntegerArray published;
+    private final AtomicIntegerArray tombstones;
+    private final CountDownLatch firstPublished = new CountDownLatch(1);
 
     private final int[] levels;
     private final int[] layer0;
     private final int[][] upper;
     private final int layer0Stride;
     private final int upperStride;
-    private final boolean[] deleted;
-    private int entryPoint = -1;
-    private int maxLevel = -1;
-    private int size;
-    private int liveCount;
+    private volatile int entryPoint = -1;
+    private volatile int maxLevel = -1;
 
     /** Creates an index with SIMD kernels, on-heap storage and prefetch batching. */
     public HnswIndex(HnswParams params) {
@@ -62,9 +80,9 @@ public final class HnswIndex implements VectorIndex {
     /**
      * Creates an index with explicit kernel and storage choices and prefetch batching.
      *
-     * @param params       construction parameters
-     * @param preferSimd   whether to use the Vector API when available
-     * @param storageMode  heap or off-heap vector storage
+     * @param params      construction parameters
+     * @param preferSimd  whether to use the Vector API when available
+     * @param storageMode heap or off-heap vector storage
      */
     public HnswIndex(HnswParams params, boolean preferSimd, StorageMode storageMode) {
         this(params, preferSimd, storageMode, true);
@@ -73,17 +91,17 @@ public final class HnswIndex implements VectorIndex {
     /**
      * Creates an index with explicit kernel, storage and traversal choices.
      *
-     * @param params       construction parameters
-     * @param preferSimd   whether to use the Vector API when available
-     * @param storageMode  heap or off-heap vector storage
-     * @param prefetch     whether to batch neighbor discovery before computing distances
+     * @param params      construction parameters
+     * @param preferSimd  whether to use the Vector API when available
+     * @param storageMode heap or off-heap vector storage
+     * @param prefetch    whether to batch neighbor discovery before computing distances
      */
     public HnswIndex(HnswParams params, boolean preferSimd, StorageMode storageMode,
                      boolean prefetch) {
         this.params = Objects.requireNonNull(params, "params must not be null");
         this.storageMode = Objects.requireNonNull(storageMode, "storageMode must not be null");
         this.prefetch = prefetch;
-        DistanceFunction kernel = DistanceFunctions.forMetric(params.metric(), preferSimd);
+        var kernel = DistanceFunctions.forMetric(params.metric(), preferSimd);
         this.store = switch (storageMode) {
             case HEAP -> new HeapVectorStore(params.dimension(), params.maxElements(), kernel);
             case OFF_HEAP -> new OffHeapVectorStore(params.dimension(), params.maxElements(), kernel);
@@ -95,7 +113,11 @@ public final class HnswIndex implements VectorIndex {
         this.upperStride = 1 + params.m();
         this.layer0 = new int[Math.multiplyExact(capacity, layer0Stride)];
         this.upper = new int[capacity][];
-        this.deleted = new boolean[capacity];
+        this.published = new AtomicIntegerArray(capacity);
+        this.tombstones = new AtomicIntegerArray(capacity);
+        for (int i = 0; i < LOCK_STRIPES; i++) {
+            nodeLocks[i] = new ReentrantLock();
+        }
         this.scratch = ThreadLocal.withInitial(() -> new SearchScratch(
                 params.dimension(), capacity,
                 Math.max(params.efConstruction(), params.efSearch()), params.maxM0()));
@@ -103,29 +125,42 @@ public final class HnswIndex implements VectorIndex {
 
     @Override
     public int add(float[] vector) {
-        float[] prepared = prepare(vector, scratch.get().query);
         SearchScratch local = scratch.get();
-        lock.writeLock().lock();
+        float[] prepared = prepare(vector, local.query);
+        int id = size.getAndIncrement();
+        if (id >= params.maxElements()) {
+            throw new IllegalStateException(
+                    "index capacity exceeded: " + params.maxElements() + " elements");
+        }
         try {
-            if (size >= params.maxElements()) {
-                throw new IllegalStateException(
-                        "index capacity exceeded: " + params.maxElements() + " elements");
-            }
-            int id = size++;
-            liveCount++;
             store.set(id, prepared);
             int level = randomLevel();
             levels[id] = level;
             if (level > 0) {
                 upper[id] = new int[level * upperStride];
             }
+            published.set(id, 1);
 
             if (id == 0) {
-                entryPoint = 0;
-                maxLevel = level;
+                entryPointLock.lock();
+                try {
+                    entryPoint = 0;
+                    maxLevel = level;
+                } finally {
+                    entryPointLock.unlock();
+                }
+                liveCount.incrementAndGet();
+                firstPublished.countDown();
                 return id;
             }
 
+            try {
+                firstPublished.await();
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("interrupted while waiting for the first node",
+                        exception);
+            }
             int[] entryPoints = {entryPoint};
             for (int layer = maxLevel; layer > level; layer--) {
                 entryPoints = new int[] {greedyDescend(prepared, entryPoints[0], layer, layer - 1)};
@@ -140,30 +175,100 @@ public final class HnswIndex implements VectorIndex {
                         params.m(), local.chosen);
                 int[] chosen = Arrays.copyOf(local.chosen, chosenCount);
                 int bound = layer == 0 ? params.maxM0() : params.m();
-                setNeighbors(id, layer, chosen, chosenCount);
+
+                ReentrantLock selfLock = nodeLocks[id & LOCK_MASK];
+                selfLock.lock();
+                try {
+                    setNeighbors(id, layer, chosen, chosenCount);
+                } finally {
+                    selfLock.unlock();
+                }
+
                 for (int neighbor : chosen) {
-                    int count = neighborCount(neighbor, layer);
-                    if (count < bound) {
-                        setNeighborAt(neighbor, layer, count, id);
-                        setNeighborCount(neighbor, layer, count + 1);
-                    } else {
-                        int combinedCount = gatherWithExtra(neighbor, layer, id, local);
-                        sortCandidates(local.combinedIds, local.combinedDistances, combinedCount);
-                        int prunedCount = selectByStrategy(neighbor, local.combinedIds,
-                                local.combinedDistances, combinedCount, bound, local.chosen);
-                        setNeighbors(neighbor, layer, local.chosen, prunedCount);
+                    ReentrantLock lock = nodeLocks[neighbor & LOCK_MASK];
+                    lock.lock();
+                    try {
+                        int count = degree(neighbor, layer);
+                        if (count < bound) {
+                            setNeighborAt(neighbor, layer, count, id);
+                            setDegree(neighbor, layer, count + 1);
+                        } else {
+                            int combinedCount = gatherWithExtra(neighbor, layer, id, local);
+                            sortCandidates(local.combinedIds, local.combinedDistances, combinedCount);
+                            int prunedCount = selectByStrategy(neighbor, local.combinedIds,
+                                    local.combinedDistances, combinedCount, bound, local.chosen);
+                            setNeighbors(neighbor, layer, local.chosen, prunedCount);
+                        }
+                    } finally {
+                        lock.unlock();
                     }
                 }
                 entryPoints = foundIds;
             }
 
             if (level > maxLevel) {
-                entryPoint = id;
-                maxLevel = level;
+                entryPointLock.lock();
+                try {
+                    if (level > maxLevel) {
+                        entryPoint = id;
+                        maxLevel = level;
+                    }
+                } finally {
+                    entryPointLock.unlock();
+                }
             }
+            liveCount.incrementAndGet();
             return id;
+        } catch (RuntimeException | Error failure) {
+            tombstones.set(id, 1);
+            throw failure;
+        }
+    }
+
+    /**
+     * Inserts all vectors in parallel using a fixed number of worker threads.
+     *
+     * @param vectors array of vectors to add
+     * @param threads number of worker threads, must be positive
+     */
+    public void addAll(float[][] vectors, int threads) {
+        Objects.requireNonNull(vectors, "vectors must not be null");
+        if (threads <= 0) {
+            throw new IllegalArgumentException("threads must be > 0, got " + threads);
+        }
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        try {
+            List<Future<?>> futures = new ArrayList<>();
+            for (int worker = 0; worker < threads; worker++) {
+                final int first = worker;
+                futures.add(pool.submit(() -> {
+                    for (int i = first; i < vectors.length; i += threads) {
+                        add(vectors[i]);
+                    }
+                }));
+            }
+            for (Future<?> future : futures) {
+                future.get();
+            }
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("parallel insertion interrupted", exception);
+        } catch (java.util.concurrent.ExecutionException exception) {
+            Throwable cause = exception.getCause();
+            if (cause instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw new IllegalStateException("parallel insertion failed", cause);
         } finally {
-            lock.writeLock().unlock();
+            pool.shutdown();
+            try {
+                pool.awaitTermination(1, TimeUnit.MINUTES);
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -182,36 +287,27 @@ public final class HnswIndex implements VectorIndex {
         }
         SearchScratch local = scratch.get();
         float[] prepared = prepare(query, local.query);
-        lock.readLock().lock();
-        try {
-            if (size == 0) {
-                return List.of();
-            }
-            int entry = greedyDescend(prepared, entryPoint, maxLevel, 1);
-            local.entryBuffer[0] = entry;
-            int found = searchLayer(prepared, local.entryBuffer, 1, Math.max(efSearch, k),
-                    0, local);
-            List<SearchResult> results = new ArrayList<>(Math.min(k, found));
-            for (int i = 0; i < found && results.size() < k; i++) {
-                int id = local.foundIds[i];
-                if (!deleted[id]) {
-                    results.add(new SearchResult(id, local.foundDistances[i]));
-                }
-            }
-            return results;
-        } finally {
-            lock.readLock().unlock();
+        int currentSize = size.get();
+        int start = entryPoint;
+        if (currentSize == 0 || start < 0) {
+            return List.of();
         }
+        int entry = greedyDescend(prepared, start, maxLevel, 1);
+        local.entryBuffer[0] = entry;
+        int found = searchLayer(prepared, local.entryBuffer, 1, Math.max(efSearch, k), 0, local);
+        List<SearchResult> results = new ArrayList<>(Math.min(k, found));
+        for (int i = 0; i < found && results.size() < k; i++) {
+            int id = local.foundIds[i];
+            if (tombstones.get(id) == 0) {
+                results.add(new SearchResult(id, local.foundDistances[i]));
+            }
+        }
+        return results;
     }
 
     @Override
     public int size() {
-        lock.readLock().lock();
-        try {
-            return size;
-        } finally {
-            lock.readLock().unlock();
-        }
+        return size.get();
     }
 
     /**
@@ -223,34 +319,23 @@ public final class HnswIndex implements VectorIndex {
      * @throws IllegalArgumentException if {@code id} is outside {@code [0, size())}
      */
     public boolean delete(int id) {
-        lock.writeLock().lock();
-        try {
-            if (id < 0 || id >= size) {
-                throw new IllegalArgumentException("id outside [0, size()): " + id);
-            }
-            if (deleted[id]) {
-                return false;
-            }
-            deleted[id] = true;
-            liveCount--;
-            return true;
-        } finally {
-            lock.writeLock().unlock();
+        if (id < 0 || id >= size.get()) {
+            throw new IllegalArgumentException("id outside [0, size()): " + id);
         }
+        if (tombstones.getAndSet(id, 1) != 0) {
+            return false;
+        }
+        liveCount.decrementAndGet();
+        return true;
     }
 
     /** @return number of live vectors, excluding tombstones */
     public int liveCount() {
-        lock.readLock().lock();
-        try {
-            return liveCount;
-        } finally {
-            lock.readLock().unlock();
-        }
+        return liveCount.get();
     }
 
     boolean isDeleted(int id) {
-        return deleted[id];
+        return tombstones.get(id) != 0;
     }
 
     @Override
@@ -275,7 +360,74 @@ public final class HnswIndex implements VectorIndex {
 
     @Override
     public void save(Path path) throws IOException {
-        throw new UnsupportedOperationException("Persistence is implemented in Phase 5");
+        HnswSerializer.save(snapshot(), path);
+    }
+
+    /** Loads a full in-memory index from a v1 file. */
+    public static HnswIndex load(Path path) throws IOException {
+        return fromSnapshot(HnswSerializer.load(path));
+    }
+
+    /** Opens a read-only memory-mapped index. */
+    public static VectorIndex loadMapped(Path path) throws IOException {
+        return MappedHnswIndex.open(path);
+    }
+
+    /** Returns a consistent-enough snapshot of the current graph state. */
+    public IndexSnapshot snapshot() {
+        int count = size.get();
+        float[] vectors = new float[count * params.dimension()];
+        for (int id = 0; id < count; id++) {
+            float[] vector = store.copyOf(id);
+            System.arraycopy(vector, 0, vectors, id * params.dimension(), params.dimension());
+        }
+        int[] levelCopy = Arrays.copyOf(levels, count);
+        int[] layer0Copy = Arrays.copyOf(layer0, count * layer0Stride);
+        int[][] upperCopy = new int[params.maxElements()][];
+        for (int id = 0; id < count; id++) {
+            if (upper[id] != null) {
+                upperCopy[id] = upper[id].clone();
+            }
+        }
+        return new IndexSnapshot(params, count, entryPoint, maxLevel, vectors,
+                levelCopy, layer0Copy, upperCopy);
+    }
+
+    /** Rebuilds an index from a validated snapshot. */
+    public static HnswIndex fromSnapshot(IndexSnapshot snapshot) {
+        Objects.requireNonNull(snapshot, "snapshot must not be null");
+        HnswIndex index = new HnswIndex(snapshot.params());
+        int count = snapshot.size();
+        if (count < 0 || count > snapshot.params().maxElements()) {
+            throw new IllegalArgumentException("invalid snapshot size: " + count);
+        }
+        int dimension = snapshot.params().dimension();
+        if (snapshot.vectors().length != count * dimension) {
+            throw new IllegalArgumentException("snapshot vector array has the wrong length");
+        }
+        for (int id = 0; id < count; id++) {
+            float[] vector = Arrays.copyOfRange(snapshot.vectors(),
+                    id * dimension, (id + 1) * dimension);
+            index.store.set(id, vector);
+            index.levels[id] = snapshot.levels()[id];
+            if (index.levels[id] > 0) {
+                index.upper[id] = new int[index.levels[id] * index.upperStride];
+                if (snapshot.upper()[id] != null) {
+                    System.arraycopy(snapshot.upper()[id], 0, index.upper[id],
+                            0, Math.min(index.upper[id].length, snapshot.upper()[id].length));
+                }
+            }
+            index.published.set(id, 1);
+        }
+        System.arraycopy(snapshot.layer0(), 0, index.layer0, 0, snapshot.layer0().length);
+        index.size.set(count);
+        index.liveCount.set(count);
+        index.entryPoint = snapshot.entryPoint();
+        index.maxLevel = snapshot.maxLevel();
+        if (count > 0) {
+            index.firstPublished.countDown();
+        }
+        return index;
     }
 
     @Override
@@ -300,18 +452,15 @@ public final class HnswIndex implements VectorIndex {
     }
 
     int neighborCount(int id, int layer) {
-        if (layer == 0) {
-            return layer0[id * layer0Stride];
-        }
-        int[] slice = upper[id];
-        return slice == null ? 0 : slice[(layer - 1) * upperStride];
+        return degree(id, layer);
     }
 
     int neighborAt(int id, int layer, int index) {
         if (layer == 0) {
-            return layer0[id * layer0Stride + 1 + index];
+            return (int) INT_HANDLE.getAcquire(layer0, id * layer0Stride + 1 + index);
         }
-        return upper[id][(layer - 1) * upperStride + 1 + index];
+        return (int) INT_HANDLE.getAcquire(upper[id],
+                (layer - 1) * upperStride + 1 + index);
     }
 
     int[] selectHeuristic(int baseId, List<Candidate> sorted, int limit, boolean keepPruned) {
@@ -323,41 +472,49 @@ public final class HnswIndex implements VectorIndex {
             distances[i] = sorted.get(i).distance();
         }
         int[] out = new int[limit];
-        int selected = selectNeighbors(baseId, ids, distances, count, limit, out, keepPruned);
+        int selected = selectHeuristic(ids, distances, count, limit, out, keepPruned);
         return Arrays.copyOf(out, selected);
+    }
+
+    private int degree(int id, int layer) {
+        if (layer == 0) {
+            return (int) INT_HANDLE.getAcquire(layer0, id * layer0Stride);
+        }
+        int[] slice = upper[id];
+        return slice == null ? 0 : (int) INT_HANDLE.getAcquire(slice, (layer - 1) * upperStride);
+    }
+
+    private void setDegree(int id, int layer, int count) {
+        if (layer == 0) {
+            INT_HANDLE.setRelease(layer0, id * layer0Stride, count);
+        } else {
+            INT_HANDLE.setRelease(upper[id], (layer - 1) * upperStride, count);
+        }
     }
 
     private void setNeighbors(int id, int layer, int[] ids, int count) {
         if (layer == 0) {
             int offset = id * layer0Stride;
-            layer0[offset] = count;
             System.arraycopy(ids, 0, layer0, offset + 1, count);
+            INT_HANDLE.setRelease(layer0, offset, count);
         } else {
             int[] slice = upper[id];
             int offset = (layer - 1) * upperStride;
-            slice[offset] = count;
             System.arraycopy(ids, 0, slice, offset + 1, count);
-        }
-    }
-
-    private void setNeighborCount(int id, int layer, int count) {
-        if (layer == 0) {
-            layer0[id * layer0Stride] = count;
-        } else {
-            upper[id][(layer - 1) * upperStride] = count;
+            INT_HANDLE.setRelease(slice, offset, count);
         }
     }
 
     private void setNeighborAt(int id, int layer, int index, int neighbor) {
         if (layer == 0) {
-            layer0[id * layer0Stride + 1 + index] = neighbor;
+            INT_HANDLE.setRelease(layer0, id * layer0Stride + 1 + index, neighbor);
         } else {
-            upper[id][(layer - 1) * upperStride + 1 + index] = neighbor;
+            INT_HANDLE.setRelease(upper[id], (layer - 1) * upperStride + 1 + index, neighbor);
         }
     }
 
     private int gatherWithExtra(int baseId, int layer, int extraId, SearchScratch local) {
-        int count = neighborCount(baseId, layer);
+        int count = degree(baseId, layer);
         for (int i = 0; i < count; i++) {
             int id = neighborAt(baseId, layer, i);
             local.combinedIds[i] = id;
@@ -384,8 +541,18 @@ public final class HnswIndex implements VectorIndex {
         }
     }
 
-    private int selectNeighbors(int baseId, int[] ids, float[] distances, int count,
-                                int limit, int[] out, boolean keepPruned) {
+    private int selectByStrategy(int baseId, int[] ids, float[] distances, int count,
+                                 int limit, int[] out) {
+        if (params.neighborSelection() == NeighborSelection.SIMPLE) {
+            int result = Math.min(limit, count);
+            System.arraycopy(ids, 0, out, 0, result);
+            return result;
+        }
+        return selectHeuristic(ids, distances, count, limit, out, false);
+    }
+
+    private int selectHeuristic(int[] ids, float[] distances, int count, int limit,
+                                int[] out, boolean keepPruned) {
         int selected = 0;
         boolean[] used = new boolean[count];
         for (int i = 0; i < count && selected < limit; i++) {
@@ -411,18 +578,11 @@ public final class HnswIndex implements VectorIndex {
         return selected;
     }
 
-    private int selectByStrategy(int baseId, int[] ids, float[] distances, int count,
-                                 int limit, int[] out) {
-        if (params.neighborSelection() == NeighborSelection.SIMPLE) {
-            int result = Math.min(limit, count);
-            System.arraycopy(ids, 0, out, 0, result);
-            return result;
-        }
-        return selectNeighbors(baseId, ids, distances, count, limit, out, false);
-    }
-
     private int randomLevel() {
-        double uniform = 1.0 - random.nextDouble();
+        double uniform;
+        synchronized (randomLock) {
+            uniform = 1.0 - random.nextDouble();
+        }
         int level = (int) Math.floor(-Math.log(uniform) * params.levelMult());
         return Math.min(level, MAX_LEVEL_CAP);
     }
@@ -435,7 +595,8 @@ public final class HnswIndex implements VectorIndex {
         local.ensureFound(ef);
         for (int i = 0; i < entryCount; i++) {
             int entry = entryPoints[i];
-            if (entry < 0 || entry >= size || !local.visited.mark(entry)) {
+            if (entry < 0 || entry >= size.get() || published.get(entry) == 0
+                    || !local.visited.mark(entry)) {
                 continue;
             }
             float distanceToEntry = store.dist(query, entry);
@@ -451,12 +612,13 @@ public final class HnswIndex implements VectorIndex {
             if (layer > levels[current]) {
                 continue;
             }
-            int count = neighborCount(current, layer);
+            int count = degree(current, layer);
             if (prefetch) {
                 int batch = 0;
                 for (int i = 0; i < count; i++) {
                     int neighbor = neighborAt(current, layer, i);
-                    if (neighbor >= 0 && neighbor < size && local.visited.mark(neighbor)) {
+                    if (neighbor >= 0 && neighbor < size.get() && published.get(neighbor) == 1
+                            && local.visited.mark(neighbor)) {
                         local.neighborBatch[batch++] = neighbor;
                     }
                 }
@@ -472,7 +634,8 @@ public final class HnswIndex implements VectorIndex {
             } else {
                 for (int i = 0; i < count; i++) {
                     int neighbor = neighborAt(current, layer, i);
-                    if (neighbor < 0 || neighbor >= size || !local.visited.mark(neighbor)) {
+                    if (neighbor < 0 || neighbor >= size.get() || published.get(neighbor) == 0
+                            || !local.visited.mark(neighbor)) {
                         continue;
                     }
                     float distanceToNeighbor = store.dist(query, neighbor);
@@ -503,10 +666,10 @@ public final class HnswIndex implements VectorIndex {
             do {
                 improved = false;
                 int node = current;
-                int count = neighborCount(node, layer);
+                int count = degree(node, layer);
                 for (int i = 0; i < count; i++) {
                     int neighbor = neighborAt(node, layer, i);
-                    if (neighbor < 0 || neighbor >= size) {
+                    if (neighbor < 0 || neighbor >= size.get() || published.get(neighbor) == 0) {
                         continue;
                     }
                     float distanceToNeighbor = store.dist(query, neighbor);

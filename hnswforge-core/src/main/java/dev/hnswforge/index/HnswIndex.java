@@ -21,7 +21,9 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * whose results are used to connect the new node bidirectionally. Searches use the
  * same best-first procedure at layer 0 after a greedy descent from the top layer.
  * All randomness comes from the seed in {@link HnswParams}, so a given seed and
- * insertion order produce an identical graph.
+ * insertion order produce an identical graph. Deletes are tombstones: deleted nodes
+ * remain in the graph and are traversed but never returned; {@link #liveCount()}
+ * excludes them while {@link #size()} counts every inserted vector.
  *
  * <p>Thread-safety: thread-safe. Inserts take the write lock and searches take the
  * read lock; reads therefore never observe a partially inserted node.
@@ -38,9 +40,11 @@ public final class HnswIndex implements VectorIndex {
     private final int[] levels;
     private final int[][][] neighbors;
     private final int[][] neighborCounts;
+    private final boolean[] deleted;
     private int entryPoint = -1;
     private int maxLevel = -1;
     private int size;
+    private int liveCount;
 
     /** Creates an empty index with the capacity declared in {@code params}. */
     public HnswIndex(HnswParams params) {
@@ -52,6 +56,7 @@ public final class HnswIndex implements VectorIndex {
         this.levels = new int[capacity];
         this.neighbors = new int[capacity][][];
         this.neighborCounts = new int[capacity][];
+        this.deleted = new boolean[capacity];
     }
 
     @Override
@@ -64,6 +69,7 @@ public final class HnswIndex implements VectorIndex {
                         "index capacity exceeded: " + vectors.length + " elements");
             }
             int id = size++;
+            liveCount++;
             vectors[id] = stored;
             int level = randomLevel();
             levels[id] = level;
@@ -135,11 +141,14 @@ public final class HnswIndex implements VectorIndex {
             int entry = greedyDescend(prepared, entryPoint, maxLevel, 1);
             List<Candidate> found = searchLayer(prepared, new int[] {entry},
                     Math.max(efSearch, k), 0);
-            int limit = Math.min(k, found.size());
-            List<SearchResult> results = new ArrayList<>(limit);
-            for (int i = 0; i < limit; i++) {
-                Candidate candidate = found.get(i);
-                results.add(new SearchResult(candidate.id(), candidate.distance()));
+            List<SearchResult> results = new ArrayList<>(Math.min(k, found.size()));
+            for (Candidate candidate : found) {
+                if (results.size() == k) {
+                    break;
+                }
+                if (!deleted[candidate.id()]) {
+                    results.add(new SearchResult(candidate.id(), candidate.distance()));
+                }
             }
             return List.copyOf(results);
         } finally {
@@ -155,6 +164,45 @@ public final class HnswIndex implements VectorIndex {
         } finally {
             lock.readLock().unlock();
         }
+    }
+
+    /**
+     * Marks a vector as deleted. Deleted nodes are still traversed during search
+     * but are never returned. The graph is not physically repaired.
+     *
+     * @param id id of an existing vector
+     * @return true if the vector was live and is now deleted, false if already deleted
+     * @throws IllegalArgumentException if {@code id} is outside {@code [0, size())}
+     */
+    public boolean delete(int id) {
+        lock.writeLock().lock();
+        try {
+            if (id < 0 || id >= size) {
+                throw new IllegalArgumentException("id outside [0, size()): " + id);
+            }
+            if (deleted[id]) {
+                return false;
+            }
+            deleted[id] = true;
+            liveCount--;
+            return true;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /** @return number of live vectors, excluding tombstones */
+    public int liveCount() {
+        lock.readLock().lock();
+        try {
+            return liveCount;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    boolean isDeleted(int id) {
+        return deleted[id];
     }
 
     @Override

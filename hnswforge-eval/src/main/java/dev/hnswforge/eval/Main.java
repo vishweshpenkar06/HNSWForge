@@ -12,8 +12,8 @@ import java.util.Set;
 /**
  * Command-line entry point for dataset evaluation.
  *
- * <p>Supported subcommands are {@code groundtruth} and {@code recall}. Bad
- * arguments print usage to standard error and produce exit code {@code 2};
+ * <p>Supported subcommands are {@code groundtruth}, {@code recall} and
+ * {@code sweep}. Bad arguments print usage to standard error and produce exit code {@code 2};
  * I/O and data failures produce exit code {@code 1}. Successful commands print
  * one line to standard output and return {@code 0}. The dispatch is a switch so
  * further subcommands can be added without restructuring the parser.
@@ -52,6 +52,7 @@ public final class Main {
     return switch (args[0]) {
       case "groundtruth" -> runGroundTruth(args);
       case "recall" -> runRecall(args);
+      case "sweep" -> runSweep(args);
       default -> usageError("Unknown subcommand: " + args[0]);
     };
   }
@@ -101,6 +102,23 @@ public final class Main {
     } catch (IllegalArgumentException e) {
       return usageError(e.getMessage());
     } catch (IOException e) {
+      return failure(e.getMessage());
+    }
+  }
+
+  /**
+   * Runs a parameter sweep and writes its CSV report.
+   *
+   * @param args the full argument array, including the subcommand at index zero
+   * @return the exit code
+   */
+  private static int runSweep(String[] args) {
+    try {
+      Sweep.run(args);
+      return 0;
+    } catch (IllegalArgumentException e) {
+      return usageError(e.getMessage());
+    } catch (IllegalStateException | IOException e) {
       return failure(e.getMessage());
     }
   }
@@ -191,6 +209,8 @@ public final class Main {
     System.err.println("  hnswforge-eval groundtruth --base <fvecs> --queries <fvecs>"
         + " --metric L2|COSINE|INNER_PRODUCT --k N --out <ivecs>");
     System.err.println("  hnswforge-eval recall --truth <ivecs> --results <text> --k N");
+    System.err.println("  hnswforge-eval sweep [--dataset sift1m|glove100|synthetic] [--n N]"
+        + " [--m a,b,c] [--efc a,b,c] [--efs a,b,c] [--k N] [--threads N] [--out <csv>]");
   }
 
   /**

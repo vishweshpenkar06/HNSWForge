@@ -189,10 +189,10 @@ public final class HnswIndex implements VectorIndex {
                     lock.lock();
                     try {
                         int count = degree(neighbor, layer);
-                        if (count < bound) {
+                        if (count < bound && !hasNeighbor(neighbor, layer, id)) {
                             setNeighborAt(neighbor, layer, count, id);
                             setDegree(neighbor, layer, count + 1);
-                        } else {
+                        } else if (count >= bound) {
                             int combinedCount = gatherWithExtra(neighbor, layer, id, local);
                             sortCandidates(local.combinedIds, local.combinedDistances, combinedCount);
                             int prunedCount = selectByStrategy(neighbor, local.combinedIds,
@@ -484,6 +484,16 @@ public final class HnswIndex implements VectorIndex {
         return slice == null ? 0 : (int) INT_HANDLE.getAcquire(slice, (layer - 1) * upperStride);
     }
 
+    private boolean hasNeighbor(int id, int layer, int neighbor) {
+        int count = degree(id, layer);
+        for (int i = 0; i < count; i++) {
+            if (neighborAt(id, layer, i) == neighbor) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void setDegree(int id, int layer, int count) {
         if (layer == 0) {
             INT_HANDLE.setRelease(layer0, id * layer0Stride, count);
@@ -493,16 +503,26 @@ public final class HnswIndex implements VectorIndex {
     }
 
     private void setNeighbors(int id, int layer, int[] ids, int count) {
-        if (layer == 0) {
-            int offset = id * layer0Stride;
-            System.arraycopy(ids, 0, layer0, offset + 1, count);
-            INT_HANDLE.setRelease(layer0, offset, count);
-        } else {
-            int[] slice = upper[id];
-            int offset = (layer - 1) * upperStride;
-            System.arraycopy(ids, 0, slice, offset + 1, count);
-            INT_HANDLE.setRelease(slice, offset, count);
+        int[] target = layer == 0 ? layer0 : upper[id];
+        int offset = layer == 0 ? id * layer0Stride : (layer - 1) * upperStride;
+        int written = 0;
+        for (int i = 0; i < count && written < params.maxM0(); i++) {
+            int neighbor = ids[i];
+            if (neighbor == id || neighbor < 0 || neighbor >= params.maxElements()) {
+                continue;
+            }
+            boolean duplicate = false;
+            for (int j = 0; j < written; j++) {
+                if (target[offset + 1 + j] == neighbor) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                target[offset + 1 + written++] = neighbor;
+            }
         }
+        INT_HANDLE.setRelease(target, offset, written);
     }
 
     private void setNeighborAt(int id, int layer, int index, int neighbor) {

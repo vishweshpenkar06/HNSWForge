@@ -1,0 +1,5 @@
+jdk:
+  - openjdk25
+before_install:
+  - ./mvnw -version
+  - echo "HNSWForge uses jdk.incubator.vector; the build adds --add-modules automatically and falls back to scalar kernels when the module is absent."

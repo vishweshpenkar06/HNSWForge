@@ -16,13 +16,17 @@ import java.util.Objects;
 import java.util.zip.CRC32;
 
 /**
- * Binary reader and writer for version 1 {@link IndexSnapshot} files.
+ * Binary reader and writer for version 1 and version 2 {@link IndexSnapshot} files.
  *
- * <p>The format is little-endian with a fixed 128-byte header followed by four
- * contiguous sections: flat float32 vectors, int32 levels, int32 layer-0 adjacency,
- * and int32 upper-layer adjacency. A CRC32 over every byte after the header
- * protects the sections. Writes go to a sibling {@code .tmp} file and are then
- * moved into place, optionally using an atomic move.
+ * <p>The format is little-endian with a fixed 128-byte header followed by flat
+ * float32 vectors, int32 levels, int32 layer-0 adjacency, and int32 upper-layer
+ * adjacency. Version 2 adds a fifth section of int32 tombstoned ids after the
+ * upper-layer adjacency, optionally preceded by zero padding to keep its offset
+ * 64-byte aligned. A CRC32 over every byte after the header protects all sections,
+ * including the padding and the deleted-id section. Version 1 files have zeros in
+ * the header slots used by version 2 for the deleted offset and length, and carry
+ * no deleted ids. Writes go to a sibling {@code .tmp} file and are then moved into
+ * place, optionally using an atomic move.
  *
  * <p>Thread-safety: stateless; all methods are safe for concurrent use on
  * different files, and concurrent reads of the same file are safe.
@@ -31,7 +35,11 @@ public final class HnswSerializer {
 
     static final int HEADER_SIZE = 128;
 
-    private static final int VERSION = 1;
+    private static final int VERSION_1 = 1;
+    private static final int VERSION_2 = 2;
+    static final int OFF_DELETED = 104;
+    static final int OFF_DELETED_LEN = 112;
+    private static final int VERSION_2_RESERVED_START = 116;
     private static final byte[] MAGIC_BYTES = {
             'H', 'N', 'S', 'W', 'F', 'R', 'G', 0x00
     };
@@ -64,7 +72,11 @@ public final class HnswSerializer {
      * <p>The snapshot is validated before any bytes are written. The file is first
      * written to a sibling {@code .tmp} file and then moved into place with an
      * atomic move where supported. On failure the temporary file is deleted and no
-     * partial output is left at {@code path}.
+     * partial output is left at {@code path}. The result is a version 2 file that
+     * includes the snapshot's tombstoned ids.
+     *
+     * <p>Thread-safety: safe for concurrent calls on different paths; concurrent
+     * writes to the same path must be serialized by the caller.
      *
      * @param snapshot snapshot to serialize, must be non-null and internally valid
      * @param path     destination path, must name a file
@@ -101,19 +113,29 @@ public final class HnswSerializer {
         } catch (ArithmeticException e) {
             throw new IllegalArgumentException("snapshot is too large to serialize", e);
         }
-        long total = HEADER_SIZE + vectorsBytes + levelsBytes + layer0Bytes + upperBytes;
-        if (total > Integer.MAX_VALUE) {
-            throw new IllegalArgumentException("snapshot is too large to serialize: " + total + " bytes");
-        }
-
         long vectorsOff = HEADER_SIZE;
         long levelsOff = vectorsOff + vectorsBytes;
         long layer0Off = levelsOff + levelsBytes;
         long upperOff = layer0Off + layer0Bytes;
+        long deletedLen = snapshot.deleted().length;
+        long deletedOff;
+        long deletedBytes;
+        long total;
+        try {
+            deletedOff = align64(Math.addExact(upperOff, upperBytes));
+            deletedBytes = Math.multiplyExact(deletedLen, (long) Integer.BYTES);
+            total = Math.addExact(deletedOff, deletedBytes);
+        } catch (ArithmeticException e) {
+            throw new IllegalArgumentException("snapshot is too large to serialize", e);
+        }
+        if (total > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("snapshot is too large to serialize: " + total + " bytes");
+        }
+
         byte[] bytes = new byte[(int) total];
         ByteBuffer buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
         buffer.put(0, MAGIC_BYTES);
-        buffer.putInt(OFF_VERSION, VERSION);
+        buffer.putInt(OFF_VERSION, VERSION_2);
         buffer.putInt(OFF_ENDIANNESS, 1);
         buffer.putInt(OFF_DIMENSION, dimension);
         buffer.putInt(OFF_METRIC, snapshot.params().metric().ordinal());
@@ -130,6 +152,8 @@ public final class HnswSerializer {
         buffer.putLong(OFF_LAYER0, layer0Off);
         buffer.putLong(OFF_UPPER, upperOff);
         buffer.putLong(OFF_UPPER_LEN, upperLen);
+        buffer.putLong(OFF_DELETED, deletedOff);
+        buffer.putInt(OFF_DELETED_LEN, (int) deletedLen);
 
         buffer.position((int) vectorsOff);
         buffer.asFloatBuffer().put(snapshot.vectors());
@@ -152,6 +176,8 @@ public final class HnswSerializer {
         if (written != upperLen) {
             throw new IllegalArgumentException("snapshot upper adjacency length mismatch");
         }
+        buffer.position((int) deletedOff);
+        buffer.asIntBuffer().put(snapshot.deleted());
 
         CRC32 crc = new CRC32();
         crc.update(bytes, HEADER_SIZE, bytes.length - HEADER_SIZE);
@@ -183,11 +209,14 @@ public final class HnswSerializer {
     }
 
     /**
-     * Reads and fully validates a version 1 snapshot from {@code path}.
+     * Reads and fully validates a version 1 or version 2 snapshot from {@code path}.
      *
      * <p>Every returned array is freshly allocated and independent of the file
-     * contents. The header, CRC, section offsets, sizes, metric, levels, degrees and
-     * neighbor ids are all checked before a snapshot is returned.
+     * contents. The header, CRC, section offsets, sizes, metric, levels, degrees,
+     * neighbor ids and, for version 2, the tombstoned ids are all checked before a
+     * snapshot is returned. Version 1 files return an empty deleted-id array.
+     *
+     * <p>Thread-safety: safe for concurrent reads of the same or different files.
      *
      * @param path source file, must be non-null
      * @return a freshly allocated snapshot
@@ -240,8 +269,12 @@ public final class HnswSerializer {
             upper[id] = slice;
             cursor += slice.length;
         }
+        int[] deleted = new int[header.deletedLen()];
+        buffer.position((int) header.deletedOff());
+        buffer.asIntBuffer().get(deleted);
+        validateDeleted(deleted, header.size());
         return new IndexSnapshot(header.params(), header.size(), header.entryPoint(),
-                header.maxLevel(), vectors, levels, layer0, upper);
+                header.maxLevel(), vectors, levels, layer0, upper, deleted);
     }
 
     static Header parseHeader(byte[] bytes, long fileSize) throws IndexFormatException {
@@ -256,14 +289,16 @@ public final class HnswSerializer {
         }
         ByteBuffer buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
         int version = buffer.getInt(OFF_VERSION);
-        if (version != VERSION) {
-            throw new IndexFormatException("unsupported version: " + version + ", expected " + VERSION);
+        if (version != VERSION_1 && version != VERSION_2) {
+            throw new IndexFormatException("unsupported version: " + version
+                    + ", expected " + VERSION_1 + " or " + VERSION_2);
         }
         int endianness = buffer.getInt(OFF_ENDIANNESS);
         if (endianness != 1) {
             throw new IndexFormatException("unsupported endianness: " + endianness);
         }
-        for (int i = RESERVED_START; i < HEADER_SIZE; i++) {
+        int reservedStart = version == VERSION_1 ? RESERVED_START : VERSION_2_RESERVED_START;
+        for (int i = reservedStart; i < HEADER_SIZE; i++) {
             if (bytes[i] != 0) {
                 throw new IndexFormatException("nonzero reserved byte at offset " + i);
             }
@@ -312,6 +347,9 @@ public final class HnswSerializer {
         long levelsBytes;
         long layer0Bytes;
         long maxUpperLen;
+        long upperEnd;
+        long deletedOff = 0;
+        int deletedLen = 0;
         long expectedLength;
         try {
             vectorsBytes = Math.multiplyExact((long) size * dimension, (long) Float.BYTES);
@@ -334,7 +372,22 @@ public final class HnswSerializer {
                 throw new IndexFormatException("upper offset mismatch: " + upperOff
                         + ", expected " + (layer0Off + layer0Bytes));
             }
-            expectedLength = Math.addExact(upperOff, Math.multiplyExact(upperLen, (long) Integer.BYTES));
+            upperEnd = Math.addExact(upperOff, Math.multiplyExact(upperLen, (long) Integer.BYTES));
+            if (version == VERSION_2) {
+                deletedOff = buffer.getLong(OFF_DELETED);
+                deletedLen = buffer.getInt(OFF_DELETED_LEN);
+                if (deletedLen < 0 || deletedLen > size) {
+                    throw new IndexFormatException("version 2 deleted length out of range: "
+                            + deletedLen + ", size " + size);
+                }
+                if (deletedOff < upperEnd || (deletedOff & 3L) != 0) {
+                    throw new IndexFormatException("version 2 deleted offset out of range: "
+                            + deletedOff + ", expected >= " + upperEnd);
+                }
+            }
+            expectedLength = version == VERSION_2
+                    ? Math.addExact(deletedOff, Math.multiplyExact((long) deletedLen, (long) Integer.BYTES))
+                    : upperEnd;
         } catch (ArithmeticException e) {
             throw new IndexFormatException("section sizes overflow", e);
         }
@@ -343,7 +396,7 @@ public final class HnswSerializer {
                     + " bytes, got " + fileSize);
         }
         return new Header(params, size, entryPoint, maxLevel, vectorsOff, levelsOff,
-                layer0Off, upperOff, upperLen, crc);
+                layer0Off, upperOff, upperLen, crc, version, deletedOff, deletedLen);
     }
 
     static void verifyCrc(byte[] bytes, Header header) throws IndexFormatException {
@@ -375,6 +428,24 @@ public final class HnswSerializer {
             throw new IndexFormatException("upper length mismatch: header says " + declaredUpperLen
                     + ", levels imply " + total);
         }
+    }
+
+    static void validateDeleted(int[] deleted, int size) throws IndexFormatException {
+        int previous = -1;
+        for (int id : deleted) {
+            if (id < 0 || id >= size) {
+                throw new IndexFormatException("deleted id out of range: " + id + ", size " + size);
+            }
+            if (id <= previous) {
+                throw new IndexFormatException("deleted ids must be sorted and distinct: "
+                        + id + " after " + previous);
+            }
+            previous = id;
+        }
+    }
+
+    private static long align64(long value) throws ArithmeticException {
+        return Math.addExact(value, 63L) & ~63L;
     }
 
     private static long expectedUpperLength(int[] levels, int upperStride) {
@@ -416,6 +487,19 @@ public final class HnswSerializer {
         }
         if (upper.length != maxElements) {
             throw new IllegalArgumentException("upper length mismatch: " + upper.length);
+        }
+        int[] deleted = Objects.requireNonNull(snapshot.deleted(), "deleted must not be null");
+        int previous = -1;
+        for (int id : deleted) {
+            if (id < 0 || id >= size) {
+                throw new IllegalArgumentException("deleted id out of range: " + id
+                        + ", size " + size);
+            }
+            if (id <= previous) {
+                throw new IllegalArgumentException("deleted ids must be sorted and distinct: "
+                        + id + " after " + previous);
+            }
+            previous = id;
         }
         for (float value : vectors) {
             if (Float.isNaN(value)) {
@@ -479,7 +563,7 @@ public final class HnswSerializer {
 
     record Header(HnswParams params, int size, int entryPoint, int maxLevel,
                   long vectorsOff, long levelsOff, long layer0Off, long upperOff,
-                  long upperLen, int crc) {
+                  long upperLen, int crc, int version, long deletedOff, int deletedLen) {
 
         int dimension() {
             return params.dimension();

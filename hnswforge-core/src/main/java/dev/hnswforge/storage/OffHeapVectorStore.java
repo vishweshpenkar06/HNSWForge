@@ -1,5 +1,7 @@
 package dev.hnswforge.storage;
 
+import java.util.concurrent.atomic.AtomicInteger;
+
 import dev.hnswforge.distance.DistanceFunction;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -27,7 +29,7 @@ public final class OffHeapVectorStore implements VectorStore {
     private final Arena arena;
     private final MemorySegment data;
     private volatile boolean closed;
-    private int size;
+    private final AtomicInteger size = new AtomicInteger();
 
     /**
      * Creates an empty off-heap store with the given capacity and distance kernel.
@@ -89,7 +91,7 @@ public final class OffHeapVectorStore implements VectorStore {
     @Override
     public int size() {
         ensureOpen();
-        return size;
+        return size.get();
     }
 
     /**
@@ -114,9 +116,7 @@ public final class OffHeapVectorStore implements VectorStore {
                     "dimension mismatch: expected " + dimension + ", got " + vector.length);
         }
         MemorySegment.copy(vector, 0, data, ValueLayout.JAVA_FLOAT, byteOffset(id), dimension);
-        if (id >= size) {
-            size = id + 1;
-        }
+        size.accumulateAndGet(id + 1, Math::max);
     }
 
     /**
@@ -198,7 +198,7 @@ public final class OffHeapVectorStore implements VectorStore {
     }
 
     private void checkId(int id) {
-        if (id < 0 || id >= size) {
+        if (id < 0 || id >= size.get()) {
             throw new IllegalArgumentException("id outside [0, size()): " + id);
         }
     }

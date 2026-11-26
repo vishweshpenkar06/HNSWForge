@@ -19,7 +19,7 @@ import java.util.Arrays;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-/** Round-trip and corruption tests for the version 1 binary format. */
+/** Round-trip and corruption tests for versions 1 and 2 of the binary format. */
 class HnswSerializerTest {
 
     @TempDir
@@ -41,10 +41,28 @@ class HnswSerializerTest {
         assertArrayEquals(original.levels(), loaded.levels());
         assertArrayEquals(original.layer0(), loaded.layer0());
         assertArrayEquals(original.upper(), loaded.upper());
+        assertArrayEquals(original.deleted(), loaded.deleted());
         assertNotSame(original.vectors(), loaded.vectors());
         assertNotSame(original.levels(), loaded.levels());
         assertNotSame(original.layer0(), loaded.layer0());
         assertNotSame(original.upper(), loaded.upper());
+        assertNotSame(original.deleted(), loaded.deleted());
+    }
+
+    @Test
+    void roundTripPreservesDeletedIds() throws IOException {
+        int[] deleted = {1, 3, 7, 19};
+        IndexSnapshot base = snapshot(Metric.L2, 42L);
+        IndexSnapshot original = new IndexSnapshot(base.params(), base.size(),
+                base.entryPoint(), base.maxLevel(), base.vectors(), base.levels(),
+                base.layer0(), base.upper(), deleted);
+        Path file = tempDir.resolve("deleted.bin");
+
+        HnswSerializer.save(original, file);
+        IndexSnapshot loaded = HnswSerializer.load(file);
+
+        assertArrayEquals(deleted, loaded.deleted());
+        assertArrayEquals(original.vectors(), loaded.vectors());
     }
 
     @Test
@@ -83,7 +101,7 @@ class HnswSerializerTest {
     @Test
     void badVersionIsRejected() throws IOException {
         byte[] bytes = validBytes();
-        ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).putInt(8, 2);
+        ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).putInt(8, 3);
         Path corrupt = write("bad-version.bin", bytes);
 
         IndexFormatException error = assertThrows(IndexFormatException.class,
@@ -126,6 +144,28 @@ class HnswSerializerTest {
     }
 
     @Test
+    void flippedDeletedSectionByteIsCaughtByCrc() throws IOException {
+        int[] deleted = {2, 5, 11};
+        IndexSnapshot base = snapshot(Metric.L2, 42L);
+        IndexSnapshot original = new IndexSnapshot(base.params(), base.size(),
+                base.entryPoint(), base.maxLevel(), base.vectors(), base.levels(),
+                base.layer0(), base.upper(), deleted);
+        Path source = tempDir.resolve("deleted-source.bin");
+        HnswSerializer.save(original, source);
+        byte[] bytes = Files.readAllBytes(source);
+        long deletedOff = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+                .getLong(HnswSerializer.OFF_DELETED);
+        assertTrue(deletedOff >= HnswSerializer.HEADER_SIZE);
+        bytes[(int) deletedOff] ^= 0x01;
+        Path corrupt = write("deleted-flipped.bin", bytes);
+
+        IndexFormatException error = assertThrows(IndexFormatException.class,
+                () -> HnswSerializer.load(corrupt));
+
+        assertTrue(error.getMessage().contains("CRC"), error.getMessage());
+    }
+
+    @Test
     void v1FixtureLoadsSuccessfully() throws IOException {
         try (InputStream input = getClass().getResourceAsStream("/v1_fixture.bin")) {
             assertNotNull(input, "v1_fixture.bin must be on the test classpath");
@@ -141,6 +181,7 @@ class HnswSerializerTest {
             assertEquals(12, loaded.levels().length);
             assertEquals(12 * (1 + loaded.params().maxM0()), loaded.layer0().length);
             assertEquals(loaded.params().maxElements(), loaded.upper().length);
+            assertArrayEquals(new int[0], loaded.deleted());
         }
     }
 

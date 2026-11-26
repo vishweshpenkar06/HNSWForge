@@ -25,15 +25,18 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.CRC32;
 
 /**
- * Read-only HNSW index backed by a memory-mapped version 1 snapshot.
+ * Read-only HNSW index backed by a memory-mapped version 1 or version 2 snapshot.
  *
  * <p>Vectors and layer-0 adjacency are read directly from the mapped region at
- * little-endian byte offsets derived from the file header; levels and upper-layer
- * adjacency are copied into immutable heap arrays on open. The mapping is owned by
- * a shared {@link Arena} held by this instance and is released by {@link #close()}.
- * Neither {@link #add(float[])} nor {@link #save(Path)} is supported. Closing the
- * index invalidates the mapping; any subsequent operation throws
- * {@link IllegalStateException}.
+ * little-endian byte offsets derived from the file header; levels, upper-layer
+ * adjacency and tombstoned ids are copied into immutable heap arrays on open.
+ * Tombstoned nodes stay in the graph and are traversed during search, but are
+ * excluded from the results returned by {@link #search(float[], int)} and
+ * {@link #search(float[], int, int)}. Version 1 files contain no tombstones. The
+ * mapping is owned by a shared {@link Arena} held by this instance and is released
+ * by {@link #close()}. Neither {@link #add(float[])} nor {@link #save(Path)} is
+ * supported. Closing the index invalidates the mapping; any subsequent operation
+ * throws {@link IllegalStateException}.
  *
  * <p>Thread-safety: safe for concurrent searches. Mapped memory and copied graph
  * arrays are read-only, and each thread uses its own scratch buffers via
@@ -56,12 +59,14 @@ public final class MappedHnswIndex implements VectorIndex {
     private final int upperStride;
     private final int[] levels;
     private final int[][] upper;
+    private final boolean[] deleted;
+    private final int deletedCount;
     private final DistanceFunction distance;
     private final ThreadLocal<SearchScratch> scratch;
     private final AtomicBoolean closed = new AtomicBoolean();
 
     private MappedHnswIndex(HnswSerializer.Header header, MemorySegment segment,
-                            Arena arena, int[] levels, int[][] upper) {
+                            Arena arena, int[] levels, int[][] upper, boolean[] deleted) {
         this.arena = arena;
         this.segment = segment;
         this.params = header.params();
@@ -74,6 +79,8 @@ public final class MappedHnswIndex implements VectorIndex {
         this.upperStride = 1 + params.m();
         this.levels = levels;
         this.upper = upper;
+        this.deleted = deleted;
+        this.deletedCount = header.deletedLen();
         this.distance = ScalarDistance.forMetric(params.metric());
         this.scratch = ThreadLocal.withInitial(() -> new SearchScratch(
                 params.dimension(), params.maxElements(),
@@ -81,11 +88,12 @@ public final class MappedHnswIndex implements VectorIndex {
     }
 
     /**
-     * Opens a version 1 snapshot for read-only searching.
+     * Opens a version 1 or version 2 snapshot for read-only searching.
      *
-     * <p>The header, CRC, section offsets and level structure are validated before
-     * the mapping is returned. On any failure the arena is released. The caller
-     * must call {@link #close()} when the index is no longer needed.
+     * <p>The header, CRC, section offsets, level structure and, for version 2, the
+     * tombstoned ids are validated before the mapping is returned. On any failure
+     * the arena is released. The caller must call {@link #close()} when the index
+     * is no longer needed.
      *
      * @param path snapshot file, must be non-null
      * @return a mapped, read-only index
@@ -132,7 +140,17 @@ public final class MappedHnswIndex implements VectorIndex {
                     cursor += (long) length * Integer.BYTES;
                     upper[id] = slice;
                 }
-                return new MappedHnswIndex(header, segment, arena, levels, upper);
+                int[] deletedIds = new int[header.deletedLen()];
+                for (int index = 0; index < deletedIds.length; index++) {
+                    deletedIds[index] = segment.get(INT_LE,
+                            header.deletedOff() + (long) index * Integer.BYTES);
+                }
+                HnswSerializer.validateDeleted(deletedIds, header.size());
+                boolean[] deleted = new boolean[header.size()];
+                for (int id : deletedIds) {
+                    deleted[id] = true;
+                }
+                return new MappedHnswIndex(header, segment, arena, levels, upper, deleted);
             } catch (IOException | RuntimeException | Error e) {
                 arena.close();
                 throw e;
@@ -163,7 +181,7 @@ public final class MappedHnswIndex implements VectorIndex {
      *
      * @param query query vector of length {@link #dimension()}
      * @param k     number of results, must be positive
-     * @return results sorted by ascending distance, ties by ascending id
+     * @return non-tombstoned results sorted by ascending distance, ties by ascending id
      * @throws IllegalArgumentException if the query or {@code k} is invalid
      * @throws IllegalStateException    if the index has been closed
      */
@@ -180,7 +198,7 @@ public final class MappedHnswIndex implements VectorIndex {
      * @param query    query vector of length {@link #dimension()}
      * @param k        number of results, must be positive
      * @param efSearch search effort, must be positive
-     * @return results sorted by ascending distance, ties by ascending id
+     * @return non-tombstoned results sorted by ascending distance, ties by ascending id
      * @throws IllegalArgumentException if the query, {@code k}, or {@code efSearch} is invalid
      * @throws IllegalStateException    if the index has been closed
      */
@@ -200,10 +218,15 @@ public final class MappedHnswIndex implements VectorIndex {
         }
         int entry = greedyDescent(prepared);
         local.entryBuffer[0] = entry;
-        int found = searchLayer(prepared, local, Math.max(efSearch, k));
+        int ef = Math.max(efSearch, Math.min(size, k + deletedCount));
+        int found = searchLayer(prepared, local, ef);
         List<SearchResult> results = new ArrayList<>(Math.min(k, found));
         for (int index = 0; index < found && results.size() < k; index++) {
-            results.add(new SearchResult(local.foundIds[index], local.foundDistances[index]));
+            int id = local.foundIds[index];
+            if (deleted[id]) {
+                continue;
+            }
+            results.add(new SearchResult(id, local.foundDistances[index]));
         }
         return List.copyOf(results);
     }

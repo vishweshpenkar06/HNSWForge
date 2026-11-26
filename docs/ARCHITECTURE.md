@@ -82,4 +82,4 @@ Deletes are tombstones: `delete(id)` flips an atomic flag and decrements `liveCo
 
 ## Persistence
 
-`save` writes a v1 little-endian file to a temporary sibling and atomically renames it; `load` validates magic, version, endianness, CRC and structural bounds; `loadMapped` memory-maps the file read-only and exposes vectors and layer-0 adjacency directly through a `MemorySegment`. Details are in `docs/FILE_FORMAT.md`.
+`save` writes a v2 little-endian file (v1 files remain readable) to a temporary sibling and atomically renames it; `load` validates magic, version, endianness, CRC and structural bounds; `loadMapped` memory-maps the file read-only and exposes vectors and layer-0 adjacency directly through a `MemorySegment`. Details are in `docs/FILE_FORMAT.md`.

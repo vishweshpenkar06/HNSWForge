@@ -16,6 +16,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -75,6 +76,34 @@ class MappedHnswIndexTest {
             assertEquals(1, results.size());
             assertEquals(37, results.get(0).id());
             assertEquals(0.0f, results.get(0).distance());
+        }
+    }
+
+    @Test
+    void deletedIdsNeverAppearInSearchResults() throws Exception {
+        float[][] base = SyntheticData.uniform(120, DIMENSION, 55L);
+        int[] deleted = {37, 38};
+        Path file = save(base, levelsFor(base.length), Metric.L2, deleted);
+        DistanceFunction distance = ScalarDistance.forMetric(Metric.L2);
+        BoundedMaxHeap exact = new BoundedMaxHeap(5);
+        for (int id = 0; id < base.length; id++) {
+            if (id != 37 && id != 38) {
+                exact.push(id, distance.distance(base[37], base[id]));
+            }
+        }
+        Set<Integer> expected = new HashSet<>();
+        while (exact.size() > 0) {
+            expected.add(exact.pop());
+        }
+
+        try (MappedHnswIndex index = MappedHnswIndex.open(file)) {
+            List<SearchResult> results = index.search(base[37], 5, 100);
+            assertEquals(5, results.size());
+            Set<Integer> actual = new HashSet<>();
+            for (SearchResult result : results) {
+                assertTrue(actual.add(result.id()));
+            }
+            assertEquals(expected, actual);
         }
     }
 
@@ -154,8 +183,14 @@ class MappedHnswIndexTest {
     }
 
     private Path save(float[][] base, int[] levels, Metric metric) throws IOException {
-        IndexSnapshot snapshot = snapshot(base, levels, metric);
-        Path file = tempDir.resolve("graph-" + metric + "-" + base.length + ".bin");
+        return save(base, levels, metric, new int[0]);
+    }
+
+    private Path save(float[][] base, int[] levels, Metric metric, int[] deleted)
+            throws IOException {
+        IndexSnapshot snapshot = snapshot(base, levels, metric, deleted);
+        Path file = tempDir.resolve("graph-" + metric + "-" + base.length
+                + "-" + Arrays.hashCode(deleted) + ".bin");
         HnswSerializer.save(snapshot, file);
         return file;
     }
@@ -169,6 +204,11 @@ class MappedHnswIndexTest {
     }
 
     private static IndexSnapshot snapshot(float[][] base, int[] levels, Metric metric) {
+        return snapshot(base, levels, metric, new int[0]);
+    }
+
+    private static IndexSnapshot snapshot(float[][] base, int[] levels, Metric metric,
+                                          int[] deleted) {
         int size = base.length;
         int m = 6;
         int maxElements = size + 16;
@@ -227,7 +267,8 @@ class MappedHnswIndexTest {
                 }
             }
         }
-        return new IndexSnapshot(params, size, entryPoint, maxLevel, vectors, levels, layer0, upper);
+        return new IndexSnapshot(params, size, entryPoint, maxLevel, vectors, levels,
+                layer0, upper, deleted);
     }
 
     private static double recall(List<SearchResult> expected, List<SearchResult> actual) {

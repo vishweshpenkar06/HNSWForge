@@ -22,18 +22,25 @@ java "${JAVA_FLAGS[@]}" -cp "${EVAL_CP}" dev.hnswforge.eval.Main sweep \
   --out results/sweep_synthetic.csv
 
 printf 'running hnswlib baseline\n'
-if ! python3 -c 'import hnswlib' >/dev/null 2>&1; then
-  python3 -m pip install hnswlib
+PYTHON=python3
+if ! "${PYTHON}" -c 'import hnswlib' >/dev/null 2>&1; then
+  if python3.12 -c 'import hnswlib' >/dev/null 2>&1; then
+    PYTHON=python3.12
+  else
+    "${PYTHON}" -m pip install --break-system-packages --target "${ROOT}/results/pylibs" hnswlib numpy
+    export PYTHONPATH="${ROOT}/results/pylibs${PYTHONPATH:+:${PYTHONPATH}}"
+  fi
 fi
-python3 scripts/hnswlib_baseline.py --synthetic 10000 32 \
+"${PYTHON}" scripts/hnswlib_baseline.py --synthetic 10000 32 \
   --m 16 --efc 200 --efs 10,20,40,80,160,320 --k 10 \
   --out results/hnswlib.csv
 
 printf 'running comparison harness\n'
 if [[ -f hnswforge-bench/target/classes/dev/hnswforge/bench/CompareMain.class ]]; then
   java "${JAVA_FLAGS[@]}" -cp "${COMPARE_CP}" dev.hnswforge.bench.CompareMain \
-    --dataset synthetic \
+    --dataset synthetic --n 10000 --k 10 \
     --systems hnswforge,hnswlib \
+    --hnswlib-csv results/hnswlib.csv \
     --efs 10,20,40,80,160,320 \
     --out results/compare.csv
 else
@@ -44,9 +51,9 @@ printf 'generating comparison charts\n'
 if [[ -f results/compare.csv ]]; then
   WATERFALL_CSV="${WATERFALL_CSV:-}"
   if [[ -n "${WATERFALL_CSV}" ]]; then
-    python3 scripts/plot_compare.py results/compare.csv "${WATERFALL_CSV}"
+    env -u PYTHONPATH python3 scripts/plot_compare.py results/compare.csv "${WATERFALL_CSV}"
   else
-    python3 scripts/plot_compare.py results/compare.csv
+    env -u PYTHONPATH python3 scripts/plot_compare.py results/compare.csv
   fi
 else
   printf 'warning: results/compare.csv not available; skipping charts\n' >&2

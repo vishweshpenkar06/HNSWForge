@@ -449,8 +449,15 @@ public final class HnswIndex implements VectorIndex {
                 upperCopy[id] = upper[id].clone();
             }
         }
+        int[] deletedIds = new int[count];
+        int deletedCount = 0;
+        for (int id = 0; id < count; id++) {
+            if (tombstones.get(id) != 0) {
+                deletedIds[deletedCount++] = id;
+            }
+        }
         return new IndexSnapshot(params, count, entryPoint, maxLevel, vectors,
-                levelCopy, layer0Copy, upperCopy);
+                levelCopy, layer0Copy, upperCopy, Arrays.copyOf(deletedIds, deletedCount));
     }
 
     /** Rebuilds an index from a validated snapshot. */
@@ -480,8 +487,14 @@ public final class HnswIndex implements VectorIndex {
             index.published.set(id, 1);
         }
         System.arraycopy(snapshot.layer0(), 0, index.layer0, 0, snapshot.layer0().length);
+        for (int id : snapshot.deleted()) {
+            if (id < 0 || id >= count) {
+                throw new IllegalArgumentException("deleted id outside [0, size): " + id);
+            }
+            index.tombstones.set(id, 1);
+        }
         index.size.set(count);
-        index.liveCount.set(count);
+        index.liveCount.set(count - snapshot.deleted().length);
         index.entryPoint = snapshot.entryPoint();
         index.maxLevel = snapshot.maxLevel();
         if (count > 0) {

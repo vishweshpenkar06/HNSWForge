@@ -84,7 +84,7 @@ Mapped load of a 1,000,000-vector index file (dim=32, 264,000,128 bytes): `open_
 
 Stress tests (all passing): 8 threads insert 50,000 vectors with degree/self-loop/duplicate invariants intact; parallel and sequential builds agree on recall within 0.01; 4 inserting + 4 searching threads run for 10 seconds with no invalid ids or worker failures; a preemptive timeout detects deadlock.
 
-Persistence: v1 round trip preserves results for 1,000 random queries; mapped load returns identical ids with distances matching within 1e-5 (the in-memory index uses SIMD float accumulation, the mapped reader uses the scalar kernel); corrupted magic, wrong version, truncated files and CRC mismatches raise `IndexFormatException`; a committed `v1` fixture loads.
+Persistence: v2 round trip preserves results for 1,000 random queries and preserves tombstones; the committed v1 fixture still loads; mapped load returns identical ids with distances matching within 1e-5 (the in-memory index uses SIMD float accumulation, the mapped reader uses the scalar kernel); corrupted magic, wrong version, truncated files and CRC mismatches raise `IndexFormatException`; a committed `v1` fixture loads.
 
 ## Real SIFT1M results (100,000-vector subset, dim=128, k=10)
 
@@ -157,6 +157,12 @@ Synthetic fixture (200 chunks, dim=16, 20 queries, gold = exact top 6), evaluate
 | hybrid RRF fusion | 1.0000 | 20 |
 
 Raw data: `results/repoprism_eval.csv`. The gap to exact is 0.0 percentage points, within the 0.5-point acceptance threshold. pgvector-only and real 72-case numbers require a real RepoPrism export and remain `TODO(human)`.
+
+## Verification pass
+
+- `./mvnw clean verify`, the release profile, and the CI smoke command all pass; 270 tests, 90.3% core line coverage.
+- Fixed and regression-tested: tombstones now survive full and mapped loads (v2 format, v1 still readable); vector-store size updates are atomic under out-of-order parallel inserts; CI smoke flag and reproduction script corrected.
+- Performance numbers in this file were measured before a period of heavy external load on the host (load average ~15); they were not remeasured because those runs would not be comparable.
 
 ## Stretch phases
 

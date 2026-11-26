@@ -103,6 +103,31 @@ class PersistenceIntegrationTest {
     }
 
     @Test
+    void tombstonesSurviveSaveAndLoad() throws Exception {
+        float[][] base = SyntheticData.uniform(300, 8, 51L);
+        HnswIndex index = HnswTestUtil.build(base,
+                HnswParams.builder(8, Metric.L2).m(8).efConstruction(100)
+                        .maxElements(300).seed(51L).build());
+        for (int id = 0; id < 30; id++) {
+            index.delete(id);
+        }
+        Path path = Files.createTempFile("hnsw-tombstones", ".bin");
+        try {
+            index.save(path);
+            HnswIndex loaded = HnswIndex.load(path);
+            assertEquals(300, loaded.size());
+            assertEquals(270, loaded.liveCount());
+            float[] query = base[150];
+            for (SearchResult result : loaded.search(query, 50, 100)) {
+                assertTrue(result.id() >= 30, "deleted id reappeared: " + result.id());
+            }
+            loaded.close();
+        } finally {
+            Files.deleteIfExists(path);
+        }
+    }
+
+    @Test
     void embeddedV1FixtureLoads() throws Exception {
         Path fixture = Path.of("src/test/resources/v1_fixture.bin");
         assertTrue(Files.exists(fixture), "fixture missing");

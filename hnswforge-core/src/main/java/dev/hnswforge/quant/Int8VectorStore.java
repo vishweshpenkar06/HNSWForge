@@ -2,6 +2,7 @@ package dev.hnswforge.quant;
 
 import dev.hnswforge.storage.VectorStore;
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.Objects;
 
 /**
@@ -32,7 +33,7 @@ public final class Int8VectorStore implements VectorStore {
     private float[] min;
     private float[] max;
     private boolean calibrated;
-    private int size;
+    private final AtomicInteger size = new AtomicInteger();
 
     /**
      * Creates a quantized store without full-precision retention.
@@ -105,7 +106,7 @@ public final class Int8VectorStore implements VectorStore {
      */
     @Override
     public int size() {
-        return size;
+        return size.get();
     }
 
     /**
@@ -158,7 +159,7 @@ public final class Int8VectorStore implements VectorStore {
                 }
             }
             if (expanded) {
-                for (int previous = 0; previous < size; previous++) {
+                for (int previous = 0; previous < size.get(); previous++) {
                     if (previous != id) {
                         reencode(previous, oldMin, oldMax, newMin, newMax);
                     }
@@ -171,9 +172,7 @@ public final class Int8VectorStore implements VectorStore {
         if (keepFullPrecision) {
             System.arraycopy(vector, 0, fullPrecision, id * dimension, dimension);
         }
-        if (id >= size) {
-            size = id + 1;
-        }
+        size.accumulateAndGet(id + 1, Math::max);
     }
 
     /**
@@ -327,7 +326,7 @@ public final class Int8VectorStore implements VectorStore {
         store.max = newMax;
         store.calibrated = true;
         if (wasCalibrated) {
-            for (int id = 0; id < store.size; id++) {
+            for (int id = 0; id < store.size.get(); id++) {
                 store.reencode(id, oldMin, oldMax, newMin, newMax);
             }
         }
@@ -395,7 +394,7 @@ public final class Int8VectorStore implements VectorStore {
     }
 
     private void checkId(int id) {
-        if (id < 0 || id >= size) {
+        if (id < 0 || id >= size.get()) {
             throw new IllegalArgumentException("id outside [0, size()): " + id);
         }
     }

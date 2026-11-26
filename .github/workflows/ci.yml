@@ -39,4 +39,4 @@ jobs:
           java-version: '25'
           cache: maven
       - name: Recall@10 smoke test (10k synthetic vectors)
-        run: ./mvnw -B -pl hnswforge-bench -am test -Dtest=BenchmarkSmokeTest -DfailIfNoTests=false
+        run: ./mvnw -B -pl hnswforge-bench -am test -Dtest=BenchmarkSmokeTest -Dsurefire.failIfNoSpecifiedTests=false

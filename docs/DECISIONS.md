@@ -25,3 +25,15 @@ One short entry per deviation or notable design choice: context, decision, reaso
 - Context: The Phase 2 implementation compared `dist(base, candidate)` to `dist(base, selected)` in the diversity heuristic instead of `dist(candidate, selected)`.
 - Decision: Corrected the condition to spec Algorithm 4 during Phase 4 and recorded the old numbers as the baseline without retroactively changing them.
 - Reason: The old graph was sparse and fast but lower recall; silently replacing the baseline numbers would make the waterfall look better than reality.
+
+## v2 persistence extension for tombstones
+
+- Context: Phase 3 added tombstones, but the Phase 5 v1 file format had no place to store them, so deleted vectors reappeared after `save`/`load` and `loadMapped`.
+- Decision: Added a v2 format that reuses 12 bytes of the former header padding for `deletedOff`/`deletedLen` and appends a CRC-covered tombstone section. Version 1 files are still read and yield no tombstones.
+- Reason: Preserves the published v1 format while making persistence round-trips actually preserve search results.
+
+## Verification pass fixes
+
+- Context: A full audit found three defects after Phase 8: the CI smoke job used `-DfailIfNoTests=false` (the wrong Surefire flag for a specified test pattern), the reproduction script could not install hnswlib on Python 3.14 and did not merge the hnswlib CSV, and vector stores tracked `size` with a plain `int`.
+- Decision: Switched the CI flag to `-Dsurefire.failIfNoSpecifiedTests=false`, added a Python 3.12/target-directory fallback plus CSV merge to `run_benchmarks.sh`, and changed all `VectorStore` implementations to an `AtomicInteger` size updated with `accumulateAndGet(id + 1, Math::max)`.
+- Reason: The plain `size` allowed lost updates under parallel inserts, so a published neighbor id could exceed the store's visible size and throw during concurrent mixed workloads; the atomic update removes that race. The other two fixes make CI and reproduction actually work.

@@ -2,6 +2,7 @@ package dev.hnswforge.storage;
 
 import dev.hnswforge.distance.DistanceFunction;
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.Objects;
 
 /**
@@ -19,7 +20,7 @@ public final class HeapVectorStore implements VectorStore {
     private final int capacity;
     private final float[] data;
     private final DistanceFunction kernel;
-    private int size;
+    private final AtomicInteger size = new AtomicInteger();
 
     /** Creates a store with the given capacity and distance kernel. */
     public HeapVectorStore(int dimension, int capacity, DistanceFunction kernel) {
@@ -44,7 +45,7 @@ public final class HeapVectorStore implements VectorStore {
 
     @Override
     public int size() {
-        return size;
+        return size.get();
     }
 
     @Override
@@ -58,9 +59,7 @@ public final class HeapVectorStore implements VectorStore {
                     + dimension + ", got " + vector.length);
         }
         System.arraycopy(vector, 0, data, id * dimension, dimension);
-        if (id >= size) {
-            size = id + 1;
-        }
+        size.accumulateAndGet(id + 1, Math::max);
     }
 
     @Override
@@ -87,7 +86,7 @@ public final class HeapVectorStore implements VectorStore {
     }
 
     private void checkId(int id) {
-        if (id < 0 || id >= size) {
+        if (id < 0 || id >= size.get()) {
             throw new IllegalArgumentException("id outside [0, size()): " + id);
         }
     }

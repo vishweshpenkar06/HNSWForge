@@ -46,7 +46,7 @@ All numbers below are measured on the machine and dataset described in `docs/RES
 
 ![Optimization waterfall](docs/charts/opt_waterfall.png)
 
-At recall@10 = 0.9995 on the synthetic 10k/dim-32 corpus, HNSWForge reaches ~3.0-4.8k QPS while hnswlib reaches 14.4k QPS — a real 3.0-4.8x gap, analyzed honestly in `docs/RESULTS.md`. Recall@10 on that corpus is 0.9995-1.0000; core line coverage is 89.9% across 241 tests.
+On a 100k subset of real SIFT1M, HNSWForge reaches **recall@10 = 0.99998** at ~912 QPS (single thread); hnswlib reaches 4,944 QPS at comparable recall — an honest 5.4x gap analyzed in `docs/RESULTS.md`. On the synthetic 10k/dim-32 corpus recall is 0.9995-1.0000. Core line coverage is 89.9% across 241 tests.
 
 ## Architecture
 

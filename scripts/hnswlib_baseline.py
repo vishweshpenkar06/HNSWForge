@@ -43,6 +43,8 @@ def parse_args():
         default="10,20,40,80,160,320",
         help="comma-separated efSearch values (default: 10,20,40,80,160,320)",
     )
+    parser.add_argument("--n", type=int, default=0, help="limit base vectors to the first N rows (0 = all)")
+    parser.add_argument("--nq", type=int, default=0, help="limit queries to the first NQ rows (0 = all)")
     parser.add_argument("--k", type=int, default=10, help="neighbours per query (default: 10)")
     parser.add_argument(
         "--out",
@@ -134,6 +136,10 @@ def main():
         base = read_fvecs(args.base)
         queries = read_fvecs(args.queries)
         dataset = Path(args.base).stem
+        if args.n > 0:
+            base = base[:args.n]
+        if args.nq > 0:
+            queries = queries[:args.nq]
         n, dim = base.shape
     if queries.shape[1] != dim:
         raise SystemExit("error: query dimension does not match base dimension")

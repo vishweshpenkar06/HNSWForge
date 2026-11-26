@@ -6,7 +6,7 @@ Benchmark tables and chart references. Numbers are recorded only after a real me
 
 - Tests: 62 passing (`./mvnw verify`), JaCoCo report generated for all modules.
 - Exact index correctness: brute-force results compared with ground truth computed by the same exact index yield `recall@10 = 1.0` (asserted in `RecallTest`, synthetic vectors).
-- Real SIFT1M 10k subset check is deferred to Phase 6 per the synthetic-first decision in `DECISIONS.md`.
+- Real SIFT1M results are recorded in the "Real SIFT1M" section below.
 
 ## Phase 2 baseline — naive HNSW
 
@@ -21,7 +21,7 @@ Measured on this machine (i7-12700H, Java 25, `-Xmx4g`, single query thread, k=1
 
 Honest caveat: uniformly random vectors in 128 dimensions are intrinsically harder for ANN than structured SIFT descriptors; the 0.4330 figure is a property of that synthetic data, not evidence of a graph bug. At 32 dimensions the same code reaches 0.9775 at efSearch=200. Real SIFT1M numbers are recorded in Phase 6.
 
-This table is the baseline for the Phase 4 optimization waterfall.
+This table is the baseline for the Phase 4 optimization waterfall; the real SIFT1M baseline is below.
 
 ## Phase 3 — parameter sweep
 
@@ -86,6 +86,22 @@ Stress tests (all passing): 8 threads insert 50,000 vectors with degree/self-loo
 
 Persistence: v1 round trip preserves results for 1,000 random queries; mapped load returns identical ids with distances matching within 1e-5 (the in-memory index uses SIMD float accumulation, the mapped reader uses the scalar kernel); corrupted magic, wrong version, truncated files and CRC mismatches raise `IndexFormatException`; a committed `v1` fixture loads.
 
+## Real SIFT1M results (100,000-vector subset, dim=128, k=10)
+
+Downloaded with `scripts/download_datasets.sh` (SIFT tar from `ftp.irisa.fr`, 160 MB). 200 official SIFT query vectors, m=16, efConstruction=200, single query thread, 3 warmup + 5 timed passes. Raw data: `results/sift_compare.csv`, `results/sift_hnswlib.csv`; charts: `docs/charts/recall_vs_qps_all_sift.png`, `latency_percentiles_sift.png`, `build_time_vs_size_sift.png`, `memory_per_1m_sift.png`.
+
+| System | efSearch | recall@10 | QPS | build_s |
+|---|---:|---:|---:|---:|
+| hnswforge | 10 | 0.99998 | 912 | 83.00 |
+| hnswforge | 320 | 0.99990 | 1,698 | 83.00 |
+| hnswlib | 40 | 0.97300 | 22,262 | 19.34 |
+| hnswlib | 80 | 0.99400 | 9,184 | 19.34 |
+| hnswlib | 160 | 0.99850 | 4,944 | 19.34 |
+| hnswlib | 320 | 1.00000 | 2,985 | 19.34 |
+| Lucene | any | 0.77401 | ~6,000-7,100 | 35.29 |
+
+This satisfies the spec's real-data acceptance criterion: recall@10 on a 100k SIFT1M subset is 0.99998, well above 0.95. At comparable recall (~0.999), hnswlib reaches 4,944 QPS versus HNSWForge's 912 QPS — a 5.4x gap, larger than on the synthetic corpus. Build time is 4.3x slower (83.00s vs 19.34s). Lucene's fixed query-time effort caps recall at 0.774 on this dataset.
+
 ## Phase 6 — baseline comparison
 
 ### Fixed environment
@@ -96,7 +112,7 @@ Persistence: v1 round trip preserves results for 1,000 random queries; mapped lo
 - JDK: OpenJDK 25.0.4.1 (Red Hat). Flags: `-Xmx4g --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED`
 - Dataset: synthetic uniform vectors, n=10,000, dim=32, k=10, 200 queries sampled near corpus vectors. m=16, efConstruction=200 for all systems. 3 warmup + 5 timed passes, median reported.
 - Systems: hnswforge (this library, SIMD + heap), hnswlib 0.8.0 (Python 3.12, single-thread query loop), Lucene 10.2.0 (`KnnFloatVectorField`, `KnnFloatVectorQuery`, forceMerge(1)), pgvector on PostgreSQL 17 in Docker (JDBC, includes network/driver overhead), BruteForceIndex (exact reference).
-- Dataset note: SIFT1M/GloVe were not downloaded; all numbers below are on the synthetic corpus. Charts and scripts support real fvecs files; the real-data run is `TODO(human)`.
+- Dataset note: the synthetic corpus was used for the table below; real SIFT1M results were measured afterwards and are reported in the "Real SIFT1M" section. GloVe was not downloaded; its run remains `TODO(human)`.
 
 ### Results (10k, dim=32, k=10)
 

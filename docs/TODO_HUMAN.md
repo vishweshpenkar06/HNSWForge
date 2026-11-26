@@ -13,8 +13,9 @@ Every placeholder introduced in the Phase 8 launch documents, plus the outstandi
 - [ ] **BLOG** — Which single next step would you actually take first, given a free weekend? (`docs/BLOG_POST.md`, section 8)
 - [ ] **LINKEDIN** — Add your personal call to action: what you are looking for, or what you would like readers to do. (`docs/LINKEDIN_POST.md`)
 - [ ] **RESUME** — If a specific job posting needs an additional metric (real SIFT1M/GloVe QPS, production RepoPrism hit@6, index size in MB per million vectors), replace the placeholder with a measured value only after the real-data run. (`docs/RESUME_BULLETS.md`)
-- [ ] **DATA** — Download SIFT1M and GloVe and rerun the Phase 6 baseline comparison on real data; all current numbers are synthetic uniform vectors (`docs/RESULTS.md`, Phase 6 dataset note).
-- [ ] **DATA** — Run the deferred real SIFT1M 10k subset recall check against exact ground truth (`docs/RESULTS.md`, Phase 1).
+- [x] **DATA** — Download SIFT1M and rerun the Phase 6 baseline comparison on real data (done: 100k subset, recall@10 = 0.99998; see `docs/RESULTS.md`, "Real SIFT1M results").
+- [ ] **DATA** — Download GloVe-100d and rerun the comparison with the cosine metric; the GloVe download is skipped by default (`docs/RESULTS.md`, Phase 6 dataset note).
+- [x] **DATA** — Real SIFT1M recall check against exact ground truth (done on the 100k subset, well above the 0.95 threshold).
 - [ ] **DATA** — Obtain a real RepoPrism export and run the real 72-case evaluation for hit@6, latency, throughput, and memory (`docs/RESULTS.md`, Phase 7; project plan Week 7).
 - [ ] **DATA** — Produce pgvector-only RepoPrism numbers on the real export (`docs/RESULTS.md`, Phase 7).
 - [ ] **INTERVIEW** — Read the HNSW paper and `docs/ARCHITECTURE.md`, and explain search and insert on a whiteboard (build spec section 15, item 1).

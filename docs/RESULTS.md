@@ -129,3 +129,15 @@ Charts: `docs/charts/recall_vs_qps_all.png`, `latency_percentiles.png`, `build_t
 4. **JIT warmup and GC.** The JVM requires warmup before reaching steady state and may trigger GCs during long query runs; native C++ is fast from the first query. Evidence: QPS varied 2,864-4,760 across efSearch values at constant recall, indicating measurement noise/JIT effects that are not present in the native baseline.
 
 No settings were cherry-picked: all efSearch values from 10 to 320 are reported for every system that supports it.
+
+## Phase 7 — RepoPrism adapter
+
+Synthetic fixture (200 chunks, dim=16, 20 queries, gold = exact top 6), evaluated with `dev.hnswforge.repoprism.ReproprismEval` on the CLI documented in `hnswforge-repoprism/INTEGRATION.md`:
+
+| Configuration | hit@6 | queries |
+|---|---:|---:|
+| exact (BruteForceIndex, cosine) | 1.0000 | 20 |
+| HNSWForge-only | 1.0000 | 20 |
+| hybrid RRF fusion | 1.0000 | 20 |
+
+Raw data: `results/repoprism_eval.csv`. The gap to exact is 0.0 percentage points, within the 0.5-point acceptance threshold. pgvector-only and real 72-case numbers require a real RepoPrism export and remain `TODO(human)`.

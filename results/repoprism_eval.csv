@@ -1,0 +1,4 @@
+configuration,hit_at_6,query_count
+exact,1.000000,20
+hnswforge,1.000000,20
+hybrid_rrf,1.000000,20

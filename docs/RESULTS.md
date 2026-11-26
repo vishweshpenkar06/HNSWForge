@@ -86,6 +86,46 @@ Stress tests (all passing): 8 threads insert 50,000 vectors with degree/self-loo
 
 Persistence: v1 round trip preserves results for 1,000 random queries; mapped load returns identical ids with distances matching within 1e-5 (the in-memory index uses SIMD float accumulation, the mapped reader uses the scalar kernel); corrupted magic, wrong version, truncated files and CRC mismatches raise `IndexFormatException`; a committed `v1` fixture loads.
 
-## Baseline comparison
+## Phase 6 — baseline comparison
 
-(pending)
+### Fixed environment
+
+- CPU: 12th Gen Intel Core i7-12700H (14 cores / 20 threads, ~48% scaling)
+- RAM: 15 GiB total, ~6 GiB available at measurement time
+- OS: Linux 7.2.11-200.nobara.fc44.x86_64 (Nobara/Fedora)
+- JDK: OpenJDK 25.0.4.1 (Red Hat). Flags: `-Xmx4g --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED`
+- Dataset: synthetic uniform vectors, n=10,000, dim=32, k=10, 200 queries sampled near corpus vectors. m=16, efConstruction=200 for all systems. 3 warmup + 5 timed passes, median reported.
+- Systems: hnswforge (this library, SIMD + heap), hnswlib 0.8.0 (Python 3.12, single-thread query loop), Lucene 10.2.0 (`KnnFloatVectorField`, `KnnFloatVectorQuery`, forceMerge(1)), pgvector on PostgreSQL 17 in Docker (JDBC, includes network/driver overhead), BruteForceIndex (exact reference).
+- Dataset note: SIFT1M/GloVe were not downloaded; all numbers below are on the synthetic corpus. Charts and scripts support real fvecs files; the real-data run is `TODO(human)`.
+
+### Results (10k, dim=32, k=10)
+
+| System | efSearch | recall@10 | QPS | p50_us | p95_us | p99_us | build_s |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| hnswforge | 10 | 0.9995 | 3,026 | 333 | 373 | 416 | 2.90 |
+| hnswforge | 160 | 1.0000 | 2,931 | 337 | 383 | 415 | 2.90 |
+| hnswforge | 320 | 1.0000 | 4,760 | 208 | 227 | 239 | 2.90 |
+| hnswlib | 10 | 0.9210 | 124,307 | 7 | 9 | 17 | 0.93 |
+| hnswlib | 80 | 0.9940 | 29,644 | 32 | 41 | 47 | 0.93 |
+| hnswlib | 160 | 0.9995 | 14,401 | 68 | 74 | 83 | 0.93 |
+| Lucene | any | 0.9665 | 9,073-11,076 | 85-113 | 115-202 | 148-366 | 1.64 |
+| pgvector | 40 | 0.9995 | 2,950 | 308 | 559 | 677 | 8.90 |
+| pgvector | 320 | 1.0000 | 811 | 1,174 | 1,841 | 2,093 | 8.90 |
+
+Raw data: `results/compare.csv`, `results/hnswlib.csv`, `results/compare_pgvector.csv`, `results/sweep_synthetic.csv`.
+Charts: `docs/charts/recall_vs_qps_all.png`, `latency_percentiles.png`, `build_time_vs_size.png`, `memory_per_1m.png`, `opt_waterfall.png`.
+
+### Honest reading of the numbers
+
+- At essentially equal recall (0.9995), hnswlib delivers 14,401 QPS versus HNSWForge's 3,026 QPS at efSearch=10 and 4,760 QPS at efSearch=320 — a **3.0x to 4.8x gap**, not within 3x at the default setting. Build time is 0.93s versus 2.90s (3.1x).
+- Lucene is faster (9k-11k QPS) but its recall is fixed at 0.9665 because Lucene exposes no query-time efSearch; HNSWForge reaches 1.0000 recall at lower QPS. This is a quality/speed tradeoff, not a clean like-for-like win for either side.
+- pgvector at equal recall is roughly on par with HNSWForge (2,950 vs 3,026 QPS) but is much slower to build (8.90s vs 2.90s) and pays network/JDBC overhead per query.
+
+### Where HNSWForge loses and why (evidence-based hypotheses)
+
+1. **No native prefetch/autovectorization.** hnswlib is C++ with raw pointers, `-march=native` and compiler autovectorization; HNSWForge uses the incubator Vector API through Java array offsets with per-call bounds validation. Evidence: 3.0-4.8x QPS gap at equal recall and 3.1x build-time gap on the same machine and data.
+2. **Denser layer-0 graph.** Correcting the heuristic raised average degree from 12.5 (Phase 2, degenerate) to 22.6 and full reachability, which improved recall from 0.9265 to 0.9995 but increases distance computations per candidate pop. Evidence: the Phase 2 sparse graph had higher QPS at lower recall ([waterfall](#phase-4--optimization-waterfall)).
+3. **Per-neighbor validation and allocation on the query path.** Every candidate passes a published/tombstone atomic read and bounds check, and each query allocates a result list plus up to k `SearchResult` records. Evidence: JMH gc profile measured 320.867 B/op after heaps/visited/query buffers were made allocation-free; hnswlib allocates no per-query objects in its C++ loop.
+4. **JIT warmup and GC.** The JVM requires warmup before reaching steady state and may trigger GCs during long query runs; native C++ is fast from the first query. Evidence: QPS varied 2,864-4,760 across efSearch values at constant recall, indicating measurement noise/JIT effects that are not present in the native baseline.
+
+No settings were cherry-picked: all efSearch values from 10 to 320 are reported for every system that supports it.

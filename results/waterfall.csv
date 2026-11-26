@@ -1,0 +1,7 @@
+step,label,qps,build_s,recall
+0,Phase2 baseline,3262,52.35,0.9265
+1,Flat+scratch,714,48.1,0.9995
+2,SIMD,1112,30.18,0.9995
+3,Off-heap,981,38.42,0.9995
+4,Prefetch,1203,29.08,0.9995
+5,Final,923,39.25,0.9995

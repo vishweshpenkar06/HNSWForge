@@ -35,6 +35,7 @@ Build with `./mvnw verify` (JDK 25 required).
 - Tombstone deletes and `liveCount()`
 - Dataset readers (fvecs/ivecs/bvecs/GloVe), ground truth, recall evaluation, parameter sweep CLI
 - JMH microbenchmarks and a baseline comparison harness (hnswlib, Lucene, pgvector)
+- Stretch: int8 quantization (4x smaller), filtered search, and a tiny REST server
 
 ## Benchmarks
 
@@ -75,7 +76,7 @@ See `docs/ARCHITECTURE.md` for data layouts, search/insert flows and the concurr
 
 ## Limitations
 
-- No distributed or sharded mode.
+- No distributed or sharded mode. Product quantization (S2) was not implemented; int8 scalar quantization is available instead.
 - Memory-mapped indexes are read-only: `add` throws `UnsupportedOperationException`.
 - Deletes are tombstones; `size()` counts all inserts while `liveCount()` excludes deleted ids.
 - Maximum level is capped at 32 and capacity is fixed at construction.
@@ -94,6 +95,16 @@ python3 scripts/plot_results.py results/sweep_synthetic.csv
 ```
 
 The comparison requires `pip install hnswlib numpy` (Python <= 3.13 for prebuilt wheels) and `docker compose -f scripts/docker-compose.pgvector.yml up -d` for pgvector. Raw CSVs are in `results/`.
+
+## REST server demo
+
+```bash
+./mvnw -q -pl hnswforge-server -am package
+java --add-modules jdk.incubator.vector -cp hnswforge-server/target/classes:hnswforge-core/target/classes dev.hnswforge.server.RestServer --port 8080 --dim 4 &
+curl -s localhost:8080/health
+curl -s -X POST localhost:8080/vectors -d '{"vector":[0.1,0.2,0.3,0.4]}'
+curl -s -X POST localhost:8080/search -d '{"vector":[0.1,0.2,0.3,0.4],"k":1}'
+```
 
 ## Contributing
 

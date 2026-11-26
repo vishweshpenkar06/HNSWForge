@@ -157,3 +157,10 @@ Synthetic fixture (200 chunks, dim=16, 20 queries, gold = exact top 6), evaluate
 | hybrid RRF fusion | 1.0000 | 20 |
 
 Raw data: `results/repoprism_eval.csv`. The gap to exact is 0.0 percentage points, within the 0.5-point acceptance threshold. pgvector-only and real 72-case numbers require a real RepoPrism export and remain `TODO(human)`.
+
+## Stretch phases
+
+- **S1 int8 scalar quantization** (`dev.hnswforge.quant.Int8VectorStore`): per-dimension min/max calibration with 256-level codes. Measured on 10,000 uniform vectors of dim 32: 320,000 code bytes versus 1,280,000 float32 bytes (4x reduction), recall@10 versus exact float32 = 0.9905, maximum dequantization error 0.017 on [-1,1] data. Full-precision rerank buffers are optional and disabled by default.
+- **S3 filtered search** (`HnswIndex.search(query, k, ef, IntPredicate)`): filtered-out nodes are still traversed but never admitted to results; when the predicate selects at most `max(64, n/20)` ids, the implementation falls back to an exact scan over matching ids. Tests cover both paths.
+- **S4 REST server** (`hnswforge-server`): `POST /vectors`, `POST /search`, `POST /snapshot`, `GET /health` using the JDK lightweight HTTP server, with a Dockerfile. Six HTTP tests pass.
+- **S2 product quantization** was not implemented: it requires k-means codebooks and ADC lookup tables, and the measured int8 tradeoff already covers the main memory/recall story. This is a deliberate scope choice, not a failed attempt.

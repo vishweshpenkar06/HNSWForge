@@ -17,6 +17,7 @@
     <module>hnswforge-eval</module>
     <module>hnswforge-bench</module>
     <module>hnswforge-repoprism</module>
+    <module>hnswforge-server</module>
   </modules>
 
   <properties>

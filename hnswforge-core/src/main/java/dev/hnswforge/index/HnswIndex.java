@@ -15,6 +15,7 @@ import java.lang.invoke.VarHandle;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
 import java.util.SplittableRandom;
@@ -26,6 +27,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.IntPredicate;
 
 /**
  * Concurrent HNSW index with flat storage and disk persistence.
@@ -303,6 +305,64 @@ public final class HnswIndex implements VectorIndex {
             }
         }
         return results;
+    }
+
+    /**
+     * Searches with a metadata filter. Filtered-out nodes are still traversed but
+     * are never admitted to the result set. When the filter selects few nodes,
+     * the search falls back to an exact scan over the matching ids.
+     *
+     * @param query  query vector
+     * @param k      number of results, must be positive
+     * @param ef     search effort, must be positive
+     * @param filter predicate over internal ids, must not be null
+     * @return up to {@code k} matching results sorted by ascending distance
+     * @throws IllegalArgumentException if inputs are invalid
+     */
+    public List<SearchResult> search(float[] query, int k, int ef, IntPredicate filter) {
+        if (k <= 0 || ef < 1) {
+            throw new IllegalArgumentException("k and ef must be positive");
+        }
+        Objects.requireNonNull(filter, "filter must not be null");
+        SearchScratch local = scratch.get();
+        float[] prepared = prepare(query, local.query);
+        int currentSize = size.get();
+        int start = entryPoint;
+        if (currentSize == 0 || start < 0) {
+            return List.of();
+        }
+        int[] matching = collectMatching(filter, currentSize);
+        if (matching.length <= Math.max(64, currentSize / 20)) {
+            List<SearchResult> exact = new ArrayList<>(matching.length);
+            for (int id : matching) {
+                exact.add(new SearchResult(id, store.dist(prepared, id)));
+            }
+            exact.sort(Comparator.comparingDouble(SearchResult::distance)
+                    .thenComparingInt(SearchResult::id));
+            return exact.size() <= k ? exact : new ArrayList<>(exact.subList(0, k));
+        }
+        int entry = greedyDescend(prepared, start, maxLevel, 1);
+        local.entryBuffer[0] = entry;
+        int found = searchLayer(prepared, local.entryBuffer, 1, Math.max(ef, k), 0, local, filter);
+        List<SearchResult> results = new ArrayList<>(Math.min(k, found));
+        for (int i = 0; i < found && results.size() < k; i++) {
+            int id = local.foundIds[i];
+            if (tombstones.get(id) == 0 && filter.test(id)) {
+                results.add(new SearchResult(id, local.foundDistances[i]));
+            }
+        }
+        return results;
+    }
+
+    private int[] collectMatching(IntPredicate filter, int currentSize) {
+        int[] ids = new int[currentSize];
+        int count = 0;
+        for (int id = 0; id < currentSize; id++) {
+            if (tombstones.get(id) == 0 && filter.test(id)) {
+                ids[count++] = id;
+            }
+        }
+        return Arrays.copyOf(ids, count);
     }
 
     @Override
@@ -609,6 +669,11 @@ public final class HnswIndex implements VectorIndex {
 
     private int searchLayer(float[] query, int[] entryPoints, int entryCount, int ef,
                             int layer, SearchScratch local) {
+        return searchLayer(query, entryPoints, entryCount, ef, layer, local, null);
+    }
+
+    private int searchLayer(float[] query, int[] entryPoints, int entryCount, int ef,
+                            int layer, SearchScratch local, IntPredicate filter) {
         local.visited.begin();
         local.candidates.clear();
         local.results.reset(ef);
@@ -621,7 +686,9 @@ public final class HnswIndex implements VectorIndex {
             }
             float distanceToEntry = store.dist(query, entry);
             local.candidates.push(entry, distanceToEntry);
-            local.results.push(entry, distanceToEntry);
+            if (filter == null || filter.test(entry)) {
+                local.results.push(entry, distanceToEntry);
+            }
         }
         while (local.candidates.size() > 0) {
             int current = local.candidates.pop();
@@ -645,9 +712,10 @@ public final class HnswIndex implements VectorIndex {
                 for (int i = 0; i < batch; i++) {
                     int neighbor = local.neighborBatch[i];
                     float distanceToNeighbor = store.dist(query, neighbor);
-                    if (local.results.size() < ef
-                            || distanceToNeighbor < local.results.peekDistance()) {
-                        local.candidates.push(neighbor, distanceToNeighbor);
+                    local.candidates.push(neighbor, distanceToNeighbor);
+                    if ((filter == null || filter.test(neighbor))
+                            && (local.results.size() < ef
+                            || distanceToNeighbor < local.results.peekDistance())) {
                         local.results.push(neighbor, distanceToNeighbor);
                     }
                 }
@@ -659,9 +727,10 @@ public final class HnswIndex implements VectorIndex {
                         continue;
                     }
                     float distanceToNeighbor = store.dist(query, neighbor);
-                    if (local.results.size() < ef
-                            || distanceToNeighbor < local.results.peekDistance()) {
-                        local.candidates.push(neighbor, distanceToNeighbor);
+                    local.candidates.push(neighbor, distanceToNeighbor);
+                    if ((filter == null || filter.test(neighbor))
+                            && (local.results.size() < ef
+                            || distanceToNeighbor < local.results.peekDistance())) {
                         local.results.push(neighbor, distanceToNeighbor);
                     }
                 }
